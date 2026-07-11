@@ -5,8 +5,10 @@ mod placement;
 pub use placement::{FilterPlacementContext, FilterPlacementPolicy, InputProvenance, Placement};
 
 use rayon::prelude::*;
-use sparkalog_relational::U32Predicate;
-use sparkalog_storage::{Column, ManagedBuffer, OperatorWorkspace};
+use sparkalog_relational::{BinaryEqualityJoin, JoinInput, JoinProjection, U32Predicate};
+use sparkalog_storage::{
+    Column, JoinWorkspace, ManagedBuffer, OperatorWorkspace, RelationView, U32RangeIndex,
+};
 use std::ffi::c_void;
 use std::fmt;
 use std::ptr::NonNull;
@@ -49,9 +51,21 @@ unsafe extern "C" {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    Cuda { operation: &'static str, code: i32 },
+    Cuda {
+        operation: &'static str,
+        code: i32,
+    },
     Storage(sparkalog_storage::Error),
     TooManyRows(usize),
+    MissingColumn {
+        input: &'static str,
+        column: u32,
+    },
+    IndexSourceMismatch {
+        relation_rows: usize,
+        index_rows: usize,
+    },
+    OutputTooLarge(u64),
 }
 
 impl fmt::Display for Error {
@@ -65,6 +79,22 @@ impl fmt::Display for Error {
                 write!(
                     formatter,
                     "{rows} rows cannot be represented by u32 row IDs"
+                )
+            }
+            Self::MissingColumn { input, column } => {
+                write!(formatter, "{input} relation has no column {column}")
+            }
+            Self::IndexSourceMismatch {
+                relation_rows,
+                index_rows,
+            } => write!(
+                formatter,
+                "right relation has {relation_rows} rows but its index has {index_rows}"
+            ),
+            Self::OutputTooLarge(rows) => {
+                write!(
+                    formatter,
+                    "join output of {rows} rows exceeds addressable memory"
                 )
             }
         }
@@ -179,6 +209,212 @@ fn check_row_count(rows: usize) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+struct IndexView<'a> {
+    keys: &'a [u32],
+    starts: &'a [u32],
+    rows: &'a [u32],
+}
+
+impl<'a> IndexView<'a> {
+    fn new(index: &'a U32RangeIndex) -> Self {
+        Self {
+            keys: index.keys().as_slice(),
+            starts: index.starts().as_slice(),
+            rows: index.rows().as_slice(),
+        }
+    }
+
+    fn lookup(self, key: u32) -> &'a [u32] {
+        let Ok(index) = self.keys.binary_search(&key) else {
+            return &[];
+        };
+        &self.rows[self.starts[index] as usize..self.starts[index + 1] as usize]
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProjectionColumn<'a> {
+    Left(&'a [u32]),
+    Right(&'a [u32]),
+}
+
+impl ProjectionColumn<'_> {
+    fn value(self, left_row: usize, right_row: usize) -> u32 {
+        match self {
+            Self::Left(column) => column[left_row],
+            Self::Right(column) => column[right_row],
+        }
+    }
+}
+
+fn relation_column<'a>(
+    relation: RelationView<'a>,
+    input: &'static str,
+    column: u32,
+) -> Result<&'a [u32]> {
+    relation
+        .column_slice(column as usize)
+        .ok_or(Error::MissingColumn { input, column })
+}
+
+fn projection_column<'a>(
+    left: RelationView<'a>,
+    right: RelationView<'a>,
+    projection: JoinProjection,
+) -> Result<ProjectionColumn<'a>> {
+    match projection.input {
+        JoinInput::Left => {
+            relation_column(left, "left", projection.column).map(ProjectionColumn::Left)
+        }
+        JoinInput::Right => {
+            relation_column(right, "right", projection.column).map(ProjectionColumn::Right)
+        }
+    }
+}
+
+fn join_inputs<'a>(
+    left: RelationView<'a>,
+    right: RelationView<'a>,
+    right_index: &'a U32RangeIndex,
+    plan: BinaryEqualityJoin,
+) -> Result<(&'a [u32], IndexView<'a>, [ProjectionColumn<'a>; 2])> {
+    check_row_count(left.len())?;
+    check_row_count(right.len())?;
+    let left_key = relation_column(left, "left", plan.left_key)?;
+    relation_column(right, "right", plan.right_key)?;
+    if right.len() != right_index.source_rows() {
+        return Err(Error::IndexSourceMismatch {
+            relation_rows: right.len(),
+            index_rows: right_index.source_rows(),
+        });
+    }
+    Ok((
+        left_key,
+        IndexView::new(right_index),
+        [
+            projection_column(left, right, plan.output[0])?,
+            projection_column(left, right, plan.output[1])?,
+        ],
+    ))
+}
+
+fn count_join_rows(
+    left_key: &[u32],
+    index: IndexView<'_>,
+    workspace: &mut JoinWorkspace,
+    parallel: bool,
+) -> Result<usize> {
+    workspace.reserve_outer_rows(left_key.len())?;
+    let (counts, offsets) = workspace.cpu_count_parts();
+    let counts = &mut counts.as_mut_slice()[..left_key.len()];
+    if parallel {
+        left_key
+            .par_iter()
+            .zip(counts.par_iter_mut())
+            .for_each(|(&key, count)| *count = index.lookup(key).len() as u64);
+    } else {
+        for (&key, count) in left_key.iter().zip(counts.iter_mut()) {
+            *count = index.lookup(key).len() as u64;
+        }
+    }
+    let offsets = &mut offsets.as_mut_slice()[..left_key.len()];
+    let mut total = 0_u64;
+    for (&count, offset) in counts.iter().zip(offsets) {
+        *offset = total;
+        total = total
+            .checked_add(count)
+            .ok_or(Error::OutputTooLarge(u64::MAX))?;
+    }
+    usize::try_from(total).map_err(|_| Error::OutputTooLarge(total))
+}
+
+/// Execute an indexed binary equality join on the calling thread.
+pub fn join_cpu_serial(
+    left: RelationView<'_>,
+    right: RelationView<'_>,
+    right_index: &U32RangeIndex,
+    plan: BinaryEqualityJoin,
+    workspace: &mut JoinWorkspace,
+) -> Result<()> {
+    let (left_key, index, projection) = join_inputs(left, right, right_index, plan)?;
+    let total = count_join_rows(left_key, index, workspace, false)?;
+    workspace.reserve_output_rows(total)?;
+    let (output, offsets) = workspace.emit_parts();
+    let offsets = &offsets.as_slice()[..left.len()];
+    let (first, second) = output.columns_mut().split_at_mut(1);
+    let output0 = &mut first[0].as_mut_slice()[..total];
+    let output1 = &mut second[0].as_mut_slice()[..total];
+
+    for (left_row, &key) in left_key.iter().enumerate() {
+        let output_start = offsets[left_row] as usize;
+        for (match_offset, &right_row) in index.lookup(key).iter().enumerate() {
+            let output_row = output_start + match_offset;
+            let right_row = right_row as usize;
+            output0[output_row] = projection[0].value(left_row, right_row);
+            output1[output_row] = projection[1].value(left_row, right_row);
+        }
+    }
+    output.set_len(total)?;
+    Ok(())
+}
+
+/// Execute an indexed binary equality join using the persistent Rayon pool.
+pub fn join_cpu_parallel(
+    left: RelationView<'_>,
+    right: RelationView<'_>,
+    right_index: &U32RangeIndex,
+    plan: BinaryEqualityJoin,
+    workspace: &mut JoinWorkspace,
+) -> Result<()> {
+    let (left_key, index, projection) = join_inputs(left, right, right_index, plan)?;
+    if left.is_empty() || rayon::current_num_threads() == 1 {
+        return join_cpu_serial(left, right, right_index, plan, workspace);
+    }
+    let total = count_join_rows(left_key, index, workspace, true)?;
+    workspace.reserve_output_rows(total)?;
+    let left_len = left.len();
+    let workers = rayon::current_num_threads().min(left_len);
+    let chunk_size = left_len.div_ceil(workers);
+    let (output, offsets) = workspace.emit_parts();
+    let offsets = &offsets.as_slice()[..left_len];
+    let (first, second) = output.columns_mut().split_at_mut(1);
+    let mut remaining0 = &mut first[0].as_mut_slice()[..total];
+    let mut remaining1 = &mut second[0].as_mut_slice()[..total];
+
+    rayon::scope(|scope| {
+        for row_start in (0..left_len).step_by(chunk_size) {
+            let row_end = (row_start + chunk_size).min(left_len);
+            let output_start = offsets[row_start] as usize;
+            let output_end = if row_end == left_len {
+                total
+            } else {
+                offsets[row_end] as usize
+            };
+            let output_len = output_end - output_start;
+            let (output0, next0) = remaining0.split_at_mut(output_len);
+            let (output1, next1) = remaining1.split_at_mut(output_len);
+            remaining0 = next0;
+            remaining1 = next1;
+            scope.spawn(move |_| {
+                for left_row in row_start..row_end {
+                    let row_output_start = offsets[left_row] as usize - output_start;
+                    for (match_offset, &right_row) in
+                        index.lookup(left_key[left_row]).iter().enumerate()
+                    {
+                        let output_row = row_output_start + match_offset;
+                        let right_row = right_row as usize;
+                        output0[output_row] = projection[0].value(left_row, right_row);
+                        output1[output_row] = projection[1].value(left_row, right_row);
+                    }
+                }
+            });
+        }
+    });
+    output.set_len(total)?;
+    Ok(())
 }
 
 /// Filter a column on the calling thread and produce ordered row IDs.
@@ -455,6 +691,7 @@ pub fn fill_mod_u32<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sparkalog_storage::Relation;
 
     fn input(values: &[u32]) -> Column {
         let mut column = Column::new_filled(values.len(), 0).unwrap();
@@ -468,6 +705,32 @@ mod tests {
             .enumerate()
             .filter_map(|(row, &value)| predicate.matches(value).then_some(row as u32))
             .collect()
+    }
+
+    fn relation2(rows: &[(u32, u32)]) -> Relation {
+        let mut relation = Relation::new(2, rows.len()).unwrap();
+        for (row, &(left, right)) in rows.iter().enumerate() {
+            relation.column_mut(0).unwrap().as_mut_slice()[row] = left;
+            relation.column_mut(1).unwrap().as_mut_slice()[row] = right;
+        }
+        relation
+    }
+
+    fn path_join_plan() -> BinaryEqualityJoin {
+        BinaryEqualityJoin {
+            left_key: 1,
+            right_key: 0,
+            output: [
+                JoinProjection {
+                    input: JoinInput::Left,
+                    column: 0,
+                },
+                JoinProjection {
+                    input: JoinInput::Right,
+                    column: 1,
+                },
+            ],
+        }
     }
 
     #[test]
@@ -581,5 +844,48 @@ mod tests {
         .unwrap();
         assert_eq!(placement, Placement::Gpu);
         assert_eq!(workspace.selection().as_slice(), expected);
+    }
+
+    #[test]
+    fn serial_and_parallel_indexed_joins_match() {
+        let left = relation2(&[(10, 1), (20, 2), (30, 1), (40, 9)]);
+        let right = relation2(&[(1, 100), (1, 101), (2, 200), (3, 300)]);
+        let index = U32RangeIndex::build(right.column(0).unwrap()).unwrap();
+        let mut serial = JoinWorkspace::new(2).unwrap();
+        let mut parallel = JoinWorkspace::new(2).unwrap();
+
+        join_cpu_serial(
+            left.view(),
+            right.view(),
+            &index,
+            path_join_plan(),
+            &mut serial,
+        )
+        .unwrap();
+        join_cpu_parallel(
+            left.view(),
+            right.view(),
+            &index,
+            path_join_plan(),
+            &mut parallel,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serial.output().view().column_slice(0).unwrap(),
+            &[10, 10, 20, 30, 30]
+        );
+        assert_eq!(
+            serial.output().view().column_slice(1).unwrap(),
+            &[100, 101, 200, 100, 101]
+        );
+        assert_eq!(
+            parallel.output().view().column_slice(0),
+            serial.output().view().column_slice(0)
+        );
+        assert_eq!(
+            parallel.output().view().column_slice(1),
+            serial.output().view().column_slice(1)
+        );
     }
 }

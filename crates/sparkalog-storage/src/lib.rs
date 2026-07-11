@@ -490,6 +490,14 @@ impl JoinWorkspace {
             &mut self.temporary,
         )
     }
+
+    pub fn cpu_count_parts(&mut self) -> (&mut ManagedBuffer<u64>, &mut ManagedBuffer<u64>) {
+        (&mut self.counts, &mut self.offsets)
+    }
+
+    pub fn emit_parts(&mut self) -> (&mut RelationBuffer, &ManagedBuffer<u64>) {
+        (&mut self.output, &self.offsets)
+    }
 }
 
 /// Compact row identifiers backed by a reusable managed allocation.
