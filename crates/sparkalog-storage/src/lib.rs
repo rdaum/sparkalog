@@ -1,5 +1,9 @@
 //! Canonical relation storage shared by native Rust and CUDA operators.
 
+mod io;
+
+pub use io::{LoadError, load_binary_u32};
+
 use std::ffi::c_void;
 use std::fmt;
 use std::ptr::NonNull;

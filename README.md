@@ -56,3 +56,30 @@ window. The measured interval begins when the filter is invoked and ends when
 its compact row-ID selection is available to the CPU. Every sample validates
 the selected cardinality. The full matrix covers 32 through 8,388,608 rows and
 1%, 10%, 50%, and 90% selectivity. Use `--quick` for a short smoke run.
+
+## Real GDlog graph data
+
+The reference checkout stores its datasets as Git LFS pointers. Materialize
+the default one-million-edge `com-dblp` graph without installing Git LFS:
+
+```sh
+scripts/fetch-gdlog-data.sh
+```
+
+GitHub currently reports that LFS is disabled for the GDlog repository, so the
+fetcher falls back to SNAP's original `com-dblp` archive and verifies its
+1,049,866-edge cardinality and decompressed SHA-256 digest. If GDlog LFS becomes
+available again, the same script verifies its declared byte length and SHA-256
+digest. Additional dataset directory names may be passed when their LFS objects
+are available.
+
+Load `com-dblp` directly into two canonical managed `u32` columns and compare
+all filter backends with:
+
+```sh
+cargo run --release --bin graph-smoke
+```
+
+The loader reads the TSV twice: once to determine relation cardinality and once
+to populate managed columns. It therefore does not build a duplicate heap copy
+of the graph.

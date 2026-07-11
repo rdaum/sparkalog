@@ -17,5 +17,9 @@ path = "src/main.rs"
 name = "filter-crossover"
 path = "src/bin/filter-crossover.rs"
 
+[[bin]]
+name = "graph-smoke"
+path = "src/bin/graph-smoke.rs"
+
 [lints]
 workspace = true
