@@ -1,6 +1,6 @@
 //! Backend-neutral relational algebra over Sparkalog's canonical storage.
 
-pub use sparkalog_storage::{Column, Relation2};
+pub use sparkalog_storage::{Column, Relation, RelationView, Selection};
 
 /// The semi-naive view of a logical relation consumed by an operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
