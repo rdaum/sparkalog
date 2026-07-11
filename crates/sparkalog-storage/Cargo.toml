@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 build = "build.rs"
 
+[dependencies]
+hi_sparse_bitset = "0.9.0"
+
 [lints]
 workspace = true
-

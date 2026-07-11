@@ -52,6 +52,41 @@ impl FilterPlacementPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinPlacementContext {
+    pub delta_rows: usize,
+    pub gpu_available: bool,
+}
+
+/// Cardinality thresholds for indexed binary equality joins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinPlacementPolicy {
+    pub gpu_min_delta_rows: usize,
+    pub gpu_unavailable_parallel_min_rows: usize,
+}
+
+impl JoinPlacementPolicy {
+    /// Thresholds from `benchmarks/join-crossover.csv`, recorded on the local
+    /// GB10 for DBLP path expansion. These are workload-specific because join
+    /// fanout and key skew affect the output work as well as delta cardinality.
+    pub const MEASURED_GB10_DBLP: Self = Self {
+        gpu_min_delta_rows: 2_048,
+        gpu_unavailable_parallel_min_rows: 2_048,
+    };
+
+    pub fn place(self, context: JoinPlacementContext) -> Placement {
+        if context.gpu_available && context.delta_rows >= self.gpu_min_delta_rows {
+            Placement::Gpu
+        } else if !context.gpu_available
+            && context.delta_rows >= self.gpu_unavailable_parallel_min_rows
+        {
+            Placement::CpuParallel
+        } else {
+            Placement::CpuSerial
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +146,32 @@ mod tests {
                 gpu_available: true,
             }),
             Placement::Gpu
+        );
+    }
+
+    #[test]
+    fn measured_join_policy_uses_the_dblp_crossover() {
+        let policy = JoinPlacementPolicy::MEASURED_GB10_DBLP;
+        assert_eq!(
+            policy.place(JoinPlacementContext {
+                delta_rows: 512,
+                gpu_available: true,
+            }),
+            Placement::CpuSerial
+        );
+        assert_eq!(
+            policy.place(JoinPlacementContext {
+                delta_rows: 2_048,
+                gpu_available: true,
+            }),
+            Placement::Gpu
+        );
+        assert_eq!(
+            policy.place(JoinPlacementContext {
+                delta_rows: 2_048,
+                gpu_available: false,
+            }),
+            Placement::CpuParallel
         );
     }
 }

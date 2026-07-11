@@ -4,6 +4,7 @@ mod io;
 
 pub use io::{LoadError, load_binary_u32};
 
+use hi_sparse_bitset::{BitSet, ImmutableBitset, config::_256bit};
 use std::ffi::c_void;
 use std::fmt;
 use std::ptr::NonNull;
@@ -237,6 +238,13 @@ impl<'a> RelationView<'a> {
             .get(index)
             .map(|column| &column.as_slice()[..self.len])
     }
+
+    pub fn prefix(self, len: usize) -> Option<Self> {
+        (len <= self.len).then_some(Self {
+            columns: self.columns,
+            len,
+        })
+    }
 }
 
 /// A capacity-backed relation used for operator output.
@@ -398,6 +406,79 @@ impl U32RangeIndex {
         let start = self.starts.as_slice()[index] as usize;
         let end = self.starts.as_slice()[index + 1] as usize;
         &self.rows.as_slice()[start..end]
+    }
+}
+
+type SparseBitmap = ImmutableBitset<_256bit>;
+
+/// A sparse bitmap posting list for one indexed `u32` value.
+pub struct U32BitmapPosting {
+    rows: SparseBitmap,
+    len: usize,
+}
+
+impl U32BitmapPosting {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn rows(&self) -> impl Iterator<Item = u32> + '_ {
+        self.rows.iter().map(|row| row as u32)
+    }
+}
+
+/// A CPU-oriented bitmap index mapping values to sparse row-ID bitsets.
+///
+/// This remains separate from [`U32RangeIndex`] so bitmap traversal can be
+/// compared without changing the canonical relation columns or the
+/// CUDA-compatible range index.
+pub struct U32BitmapIndex {
+    keys: Vec<u32>,
+    postings: Vec<U32BitmapPosting>,
+    source_rows: usize,
+}
+
+impl U32BitmapIndex {
+    pub fn build(column: &Column) -> Result<Self> {
+        if column.len() > BitSet::<_256bit>::max_capacity() {
+            return Err(Error::TooManyRows(column.len()));
+        }
+        let range = U32RangeIndex::build(column)?;
+        let mut keys = Vec::with_capacity(range.unique_keys());
+        let mut postings = Vec::with_capacity(range.unique_keys());
+        for &key in range.keys().as_slice() {
+            let row_ids = range.lookup(key);
+            let rows = BitSet::<_256bit>::from_iter(row_ids.iter().map(|&row| row as usize));
+            keys.push(key);
+            postings.push(U32BitmapPosting {
+                rows: ImmutableBitset::from(&rows),
+                len: row_ids.len(),
+            });
+        }
+        Ok(Self {
+            keys,
+            postings,
+            source_rows: column.len(),
+        })
+    }
+
+    pub fn source_rows(&self) -> usize {
+        self.source_rows
+    }
+
+    pub fn unique_keys(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn lookup(&self, key: u32) -> Option<&U32BitmapPosting> {
+        self.keys
+            .binary_search(&key)
+            .ok()
+            .map(|index| &self.postings[index])
     }
 }
 
@@ -771,6 +852,24 @@ mod tests {
         rows.sort_unstable();
         assert_eq!(rows, [0, 2, 5]);
         assert!(index.lookup(8).is_empty());
+    }
+
+    #[test]
+    fn sparse_bitmap_index_returns_canonical_rows() {
+        let mut column = Column::new_filled(6, 0).unwrap();
+        column
+            .as_mut_slice()
+            .copy_from_slice(&[90, 7, 90, 42, 7, 90]);
+        let index = U32BitmapIndex::build(&column).unwrap();
+
+        assert_eq!(index.unique_keys(), 3);
+        assert_eq!(index.lookup(7).unwrap().rows().collect::<Vec<_>>(), [1, 4]);
+        assert_eq!(index.lookup(42).unwrap().rows().collect::<Vec<_>>(), [3]);
+        assert_eq!(
+            index.lookup(90).unwrap().rows().collect::<Vec<_>>(),
+            [0, 2, 5]
+        );
+        assert!(index.lookup(8).is_none());
     }
 
     #[test]

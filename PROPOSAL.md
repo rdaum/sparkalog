@@ -103,6 +103,13 @@ Represent `edge(src, dst)` and `delta(src, dst)` as columns. Implement the
 regular expansion step of transitive closure, then sort/deduplicate the
 candidate delta. Keep the fixpoint scheduler on the CPU.
 
+The indexed expansion join is now implemented with serial Rust, Rayon, sparse
+bitmap, and CUDA count-scan-emit paths. On DBLP, contiguous range postings beat
+`hi_sparse_bitset` postings for this lookup-and-enumerate operation, while CUDA
+becomes fastest at 2,048 delta rows. Sorting, deduplication, and integration
+with the recursive `FULL`/`DELTA`/`NEWT` lifecycle remain the next part of this
+slice.
+
 ### 3. Placement policy
 
 Measure a size- and shape-based threshold for CPU versus GPU operators. This
@@ -117,6 +124,12 @@ measurements did not show a parallel-CPU region before CUDA became faster.
 This first isolated-operator matrix controls producer provenance but excludes
 the producer's own duration; later pipeline placement measurements must include
 producer work as stated above.
+
+`JoinPlacementPolicy::MEASURED_GB10_DBLP` records the first expansion-join
+threshold: serial Rust below 2,048 delta rows, then CUDA when available or
+parallel Rust otherwise. Unlike filter placement, this threshold is only a
+starting point because join fanout and key skew can change output cardinality
+substantially for the same input row count.
 
 ## Engine structure
 

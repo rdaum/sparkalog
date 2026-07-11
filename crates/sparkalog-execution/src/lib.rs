@@ -2,12 +2,16 @@
 
 mod placement;
 
-pub use placement::{FilterPlacementContext, FilterPlacementPolicy, InputProvenance, Placement};
+pub use placement::{
+    FilterPlacementContext, FilterPlacementPolicy, InputProvenance, JoinPlacementContext,
+    JoinPlacementPolicy, Placement,
+};
 
 use rayon::prelude::*;
 use sparkalog_relational::{BinaryEqualityJoin, JoinInput, JoinProjection, U32Predicate};
 use sparkalog_storage::{
-    Column, JoinWorkspace, ManagedBuffer, OperatorWorkspace, RelationView, U32RangeIndex,
+    Column, JoinWorkspace, ManagedBuffer, OperatorWorkspace, RelationView, U32BitmapIndex,
+    U32RangeIndex,
 };
 use std::ffi::c_void;
 use std::fmt;
@@ -352,9 +356,9 @@ fn join_inputs<'a>(
 
 fn count_join_rows(
     left_key: &[u32],
-    index: IndexView<'_>,
     workspace: &mut JoinWorkspace,
     parallel: bool,
+    match_count: impl Fn(u32) -> usize + Sync,
 ) -> Result<usize> {
     workspace.reserve_outer_rows(left_key.len())?;
     let (counts, offsets) = workspace.cpu_count_parts();
@@ -363,10 +367,10 @@ fn count_join_rows(
         left_key
             .par_iter()
             .zip(counts.par_iter_mut())
-            .for_each(|(&key, count)| *count = index.lookup(key).len() as u64);
+            .for_each(|(&key, count)| *count = match_count(key) as u64);
     } else {
         for (&key, count) in left_key.iter().zip(counts.iter_mut()) {
-            *count = index.lookup(key).len() as u64;
+            *count = match_count(key) as u64;
         }
     }
     let offsets = &mut offsets.as_mut_slice()[..left_key.len()];
@@ -389,7 +393,7 @@ pub fn join_cpu_serial(
     workspace: &mut JoinWorkspace,
 ) -> Result<()> {
     let (left_key, index, projection) = join_inputs(left, right, right_index, plan)?;
-    let total = count_join_rows(left_key, index, workspace, false)?;
+    let total = count_join_rows(left_key, workspace, false, |key| index.lookup(key).len())?;
     workspace.reserve_output_rows(total)?;
     let (output, offsets) = workspace.emit_parts();
     let offsets = &offsets.as_slice()[..left.len()];
@@ -422,7 +426,7 @@ pub fn join_cpu_parallel(
     if left.is_empty() || rayon::current_num_threads() == 1 {
         return join_cpu_serial(left, right, right_index, plan, workspace);
     }
-    let total = count_join_rows(left_key, index, workspace, true)?;
+    let total = count_join_rows(left_key, workspace, true, |key| index.lookup(key).len())?;
     workspace.reserve_output_rows(total)?;
     let left_len = left.len();
     let workers = rayon::current_num_threads().min(left_len);
@@ -453,6 +457,127 @@ pub fn join_cpu_parallel(
                     for (match_offset, &right_row) in
                         index.lookup(left_key[left_row]).iter().enumerate()
                     {
+                        let output_row = row_output_start + match_offset;
+                        let right_row = right_row as usize;
+                        output0[output_row] = projection[0].value(left_row, right_row);
+                        output1[output_row] = projection[1].value(left_row, right_row);
+                    }
+                }
+            });
+        }
+    });
+    output.set_len(total)?;
+    Ok(())
+}
+
+fn bitmap_join_inputs<'a>(
+    left: RelationView<'a>,
+    right: RelationView<'a>,
+    right_index: &'a U32BitmapIndex,
+    plan: BinaryEqualityJoin,
+) -> Result<(&'a [u32], [ProjectionColumn<'a>; 2])> {
+    check_row_count(left.len())?;
+    check_row_count(right.len())?;
+    let left_key = relation_column(left, "left", plan.left_key)?;
+    relation_column(right, "right", plan.right_key)?;
+    if right.len() != right_index.source_rows() {
+        return Err(Error::IndexSourceMismatch {
+            relation_rows: right.len(),
+            index_rows: right_index.source_rows(),
+        });
+    }
+    Ok((
+        left_key,
+        [
+            projection_column(left, right, plan.output[0])?,
+            projection_column(left, right, plan.output[1])?,
+        ],
+    ))
+}
+
+/// Execute a binary equality join using sparse bitmap posting lists on the
+/// calling thread.
+pub fn join_cpu_bitmap_serial(
+    left: RelationView<'_>,
+    right: RelationView<'_>,
+    right_index: &U32BitmapIndex,
+    plan: BinaryEqualityJoin,
+    workspace: &mut JoinWorkspace,
+) -> Result<()> {
+    let (left_key, projection) = bitmap_join_inputs(left, right, right_index, plan)?;
+    let total = count_join_rows(left_key, workspace, false, |key| {
+        right_index.lookup(key).map_or(0, |posting| posting.len())
+    })?;
+    workspace.reserve_output_rows(total)?;
+    let (output, offsets) = workspace.emit_parts();
+    let offsets = &offsets.as_slice()[..left.len()];
+    let (first, second) = output.columns_mut().split_at_mut(1);
+    let output0 = &mut first[0].as_mut_slice()[..total];
+    let output1 = &mut second[0].as_mut_slice()[..total];
+
+    for (left_row, &key) in left_key.iter().enumerate() {
+        let Some(posting) = right_index.lookup(key) else {
+            continue;
+        };
+        let output_start = offsets[left_row] as usize;
+        for (match_offset, right_row) in posting.rows().enumerate() {
+            let output_row = output_start + match_offset;
+            let right_row = right_row as usize;
+            output0[output_row] = projection[0].value(left_row, right_row);
+            output1[output_row] = projection[1].value(left_row, right_row);
+        }
+    }
+    output.set_len(total)?;
+    Ok(())
+}
+
+/// Execute a binary equality join using sparse bitmap posting lists and the
+/// persistent Rayon pool.
+pub fn join_cpu_bitmap_parallel(
+    left: RelationView<'_>,
+    right: RelationView<'_>,
+    right_index: &U32BitmapIndex,
+    plan: BinaryEqualityJoin,
+    workspace: &mut JoinWorkspace,
+) -> Result<()> {
+    let (left_key, projection) = bitmap_join_inputs(left, right, right_index, plan)?;
+    if left.is_empty() || rayon::current_num_threads() == 1 {
+        return join_cpu_bitmap_serial(left, right, right_index, plan, workspace);
+    }
+    let total = count_join_rows(left_key, workspace, true, |key| {
+        right_index.lookup(key).map_or(0, |posting| posting.len())
+    })?;
+    workspace.reserve_output_rows(total)?;
+    let left_len = left.len();
+    let workers = rayon::current_num_threads().min(left_len);
+    let chunk_size = left_len.div_ceil(workers);
+    let (output, offsets) = workspace.emit_parts();
+    let offsets = &offsets.as_slice()[..left_len];
+    let (first, second) = output.columns_mut().split_at_mut(1);
+    let mut remaining0 = &mut first[0].as_mut_slice()[..total];
+    let mut remaining1 = &mut second[0].as_mut_slice()[..total];
+
+    rayon::scope(|scope| {
+        for row_start in (0..left_len).step_by(chunk_size) {
+            let row_end = (row_start + chunk_size).min(left_len);
+            let output_start = offsets[row_start] as usize;
+            let output_end = if row_end == left_len {
+                total
+            } else {
+                offsets[row_end] as usize
+            };
+            let output_len = output_end - output_start;
+            let (output0, next0) = remaining0.split_at_mut(output_len);
+            let (output1, next1) = remaining1.split_at_mut(output_len);
+            remaining0 = next0;
+            remaining1 = next1;
+            scope.spawn(move |_| {
+                for left_row in row_start..row_end {
+                    let Some(posting) = right_index.lookup(left_key[left_row]) else {
+                        continue;
+                    };
+                    let row_output_start = offsets[left_row] as usize - output_start;
+                    for (match_offset, right_row) in posting.rows().enumerate() {
                         let output_row = row_output_start + match_offset;
                         let right_row = right_row as usize;
                         output0[output_row] = projection[0].value(left_row, right_row);
@@ -568,6 +693,36 @@ pub fn join_cuda(
     stream.synchronize()?;
     workspace.output_mut().set_len(total)?;
     Ok(())
+}
+
+/// Place and execute an indexed binary equality join using a measured policy.
+/// A CUDA stream being present is the GPU-availability signal.
+pub fn join_auto(
+    left: RelationView<'_>,
+    right: RelationView<'_>,
+    right_index: &U32RangeIndex,
+    plan: BinaryEqualityJoin,
+    workspace: &mut JoinWorkspace,
+    stream: Option<&CudaStream>,
+    policy: JoinPlacementPolicy,
+) -> Result<Placement> {
+    let placement = policy.place(JoinPlacementContext {
+        delta_rows: left.len(),
+        gpu_available: stream.is_some(),
+    });
+    match placement {
+        Placement::CpuSerial => join_cpu_serial(left, right, right_index, plan, workspace)?,
+        Placement::CpuParallel => join_cpu_parallel(left, right, right_index, plan, workspace)?,
+        Placement::Gpu => join_cuda(
+            left,
+            right,
+            right_index,
+            plan,
+            workspace,
+            stream.expect("GPU placement requires an available CUDA stream"),
+        )?,
+    }
+    Ok(placement)
 }
 
 /// Filter a column on the calling thread and produce ordered row IDs.
@@ -1004,8 +1159,11 @@ mod tests {
         let left = relation2(&[(10, 1), (20, 2), (30, 1), (40, 9)]);
         let right = relation2(&[(1, 100), (1, 101), (2, 200), (3, 300)]);
         let index = U32RangeIndex::build(right.column(0).unwrap()).unwrap();
+        let bitmap_index = U32BitmapIndex::build(right.column(0).unwrap()).unwrap();
         let mut serial = JoinWorkspace::new(2).unwrap();
         let mut parallel = JoinWorkspace::new(2).unwrap();
+        let mut bitmap_serial = JoinWorkspace::new(2).unwrap();
+        let mut bitmap_parallel = JoinWorkspace::new(2).unwrap();
 
         join_cpu_serial(
             left.view(),
@@ -1013,6 +1171,22 @@ mod tests {
             &index,
             path_join_plan(),
             &mut serial,
+        )
+        .unwrap();
+        join_cpu_bitmap_serial(
+            left.view(),
+            right.view(),
+            &bitmap_index,
+            path_join_plan(),
+            &mut bitmap_serial,
+        )
+        .unwrap();
+        join_cpu_bitmap_parallel(
+            left.view(),
+            right.view(),
+            &bitmap_index,
+            path_join_plan(),
+            &mut bitmap_parallel,
         )
         .unwrap();
         join_cpu_parallel(
@@ -1039,6 +1213,61 @@ mod tests {
         assert_eq!(
             parallel.output().view().column_slice(1),
             serial.output().view().column_slice(1)
+        );
+        for output in [bitmap_serial.output(), bitmap_parallel.output()] {
+            assert_eq!(
+                output.view().column_slice(0),
+                serial.output().view().column_slice(0)
+            );
+            assert_eq!(
+                output.view().column_slice(1),
+                serial.output().view().column_slice(1)
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_join_executes_the_selected_backend() {
+        let left = relation2(&[(10, 1), (20, 2), (30, 1), (40, 9)]);
+        let right = relation2(&[(1, 100), (1, 101), (2, 200), (3, 300)]);
+        let index = U32RangeIndex::build(right.column(0).unwrap()).unwrap();
+        let policy = JoinPlacementPolicy {
+            gpu_min_delta_rows: 1,
+            gpu_unavailable_parallel_min_rows: 1,
+        };
+        let mut workspace = JoinWorkspace::new(2).unwrap();
+
+        let placement = join_auto(
+            left.view(),
+            right.view(),
+            &index,
+            path_join_plan(),
+            &mut workspace,
+            None,
+            policy,
+        )
+        .unwrap();
+        assert_eq!(placement, Placement::CpuParallel);
+        assert_eq!(
+            workspace.output().view().column_slice(1).unwrap(),
+            &[100, 101, 200, 100, 101]
+        );
+
+        let stream = CudaStream::new().unwrap();
+        let placement = join_auto(
+            left.view(),
+            right.view(),
+            &index,
+            path_join_plan(),
+            &mut workspace,
+            Some(&stream),
+            policy,
+        )
+        .unwrap();
+        assert_eq!(placement, Placement::Gpu);
+        assert_eq!(
+            workspace.output().view().column_slice(1).unwrap(),
+            &[100, 101, 200, 100, 101]
         );
     }
 

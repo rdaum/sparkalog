@@ -83,3 +83,17 @@ cargo run --release --bin graph-smoke
 The loader reads the TSV twice: once to determine relation cardinality and once
 to populate managed columns. It therefore does not build a duplicate heap copy
 of the graph.
+
+Run the real indexed expansion join across progressively larger DBLP deltas:
+
+```sh
+cargo run --release --bin join-crossover -- \
+  --output benchmarks/join-crossover.csv
+```
+
+This builds both sparse range and `hi_sparse_bitset` bitmap indexes over
+`edge.source`, then evaluates `delta(x,y) ⋈ edge(y,z) → candidate(x,z)` with
+serial and parallel Rust for both index representations, plus CUDA
+count-scan-emit over the managed range index. Every backend must produce
+identical ordered output columns before its timings are recorded. Use
+`--quick` for a three-cardinality smoke run.

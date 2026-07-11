@@ -55,3 +55,31 @@ held across the tested selectivities:
 When CUDA is unavailable, the policy switches from serial to parallel Rust at
 8,388,608 rows. With CUDA available, the measured GPU threshold is reached
 first and parallel Rust is not selected.
+
+# Indexed DBLP join crossover
+
+`join-crossover.csv` records path expansion over the 1,049,866-edge SNAP DBLP
+graph. Each case joins an increasing prefix of `edge` as
+`delta(x,y) ⋈ edge(y,z) → candidate(x,z)`. Before timing, every backend is
+checked against the serial range-index output, including tuple order.
+
+The native comparison includes serial and Rayon-parallel execution over both
+a contiguous sorted posting-list index and immutable `hi_sparse_bitset`
+postings. The bitmap cardinality is stored beside each posting, so both index
+types have an O(1) count lookup before output emission. CUDA uses the managed
+range index and a count, exclusive-scan, emit pipeline.
+
+On the recorded run the 189,114-key range index built in 16.5 ms and the
+bitmap index in 70.5 ms. The range index won every serial and parallel native
+case. Bitmap iteration was 1.6x slower at 512 delta rows, 2.3x slower at
+131,072 rows, and 3.3x slower for the full graph in serial execution. This
+operator performs key lookup plus complete posting enumeration, not a set-set
+intersection, so contiguous row IDs are the better representation here.
+
+Serial range-indexed Rust won through 512 delta rows. At 2,048 rows CUDA took
+0.065 ms, versus 0.079 ms for parallel range-indexed Rust and 0.114 ms for
+serial Rust. CUDA remained fastest for every larger delta, reaching 1.477 ms
+for 7,064,738 emitted tuples. `JoinPlacementPolicy::MEASURED_GB10_DBLP`
+therefore switches to CUDA at 2,048 delta rows, or to parallel Rust at the same
+point when CUDA is unavailable. The threshold is specific to this graph's
+fanout and skew; later planning should incorporate estimated output rows.
