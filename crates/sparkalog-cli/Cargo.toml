@@ -6,8 +6,16 @@ license.workspace = true
 
 [dependencies]
 sparkalog-execution = { path = "../sparkalog-execution" }
+sparkalog-relational = { path = "../sparkalog-relational" }
 sparkalog-storage = { path = "../sparkalog-storage" }
+
+[[bin]]
+name = "sparkalog"
+path = "src/main.rs"
+
+[[bin]]
+name = "filter-crossover"
+path = "src/bin/filter-crossover.rs"
 
 [lints]
 workspace = true
-

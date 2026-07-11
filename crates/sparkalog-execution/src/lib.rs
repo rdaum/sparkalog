@@ -1,11 +1,11 @@
 //! Physical execution, synchronization, and CPU/GPU placement.
 
+use rayon::prelude::*;
 use sparkalog_relational::U32Predicate;
 use sparkalog_storage::{Column, ManagedBuffer, OperatorWorkspace};
 use std::ffi::c_void;
 use std::fmt;
 use std::ptr::NonNull;
-use std::thread;
 
 const CUDA_SUCCESS: i32 = 0;
 const CUDA_STREAM_NON_BLOCKING: u32 = 1;
@@ -33,6 +33,12 @@ unsafe extern "C" {
         count: *mut u32,
         temporary: *mut c_void,
         temporary_bytes: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    fn sparkalog_fill_mod_u32(
+        output: *mut u32,
+        len: usize,
+        modulus: u32,
         stream: *mut c_void,
     ) -> i32;
 }
@@ -215,9 +221,7 @@ pub fn filter_cpu_parallel(
         return Ok(());
     }
 
-    let workers = thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(rows);
+    let workers = rayon::current_num_threads().min(rows);
     if workers == 1 {
         return filter_cpu_serial(column, predicate, workspace);
     }
@@ -229,19 +233,15 @@ pub fn filter_cpu_parallel(
     selection.clear();
     let flags = &mut flags.as_mut_slice()[..rows];
 
-    thread::scope(|scope| {
-        for (values, output_flags) in column
-            .as_slice()
-            .chunks(chunk_size)
-            .zip(flags.chunks_mut(chunk_size))
-        {
-            scope.spawn(move || {
-                for (&value, flag) in values.iter().zip(output_flags) {
-                    *flag = u32::from(predicate.matches(value));
-                }
-            });
-        }
-    });
+    column
+        .as_slice()
+        .par_chunks(chunk_size)
+        .zip(flags.par_chunks_mut(chunk_size))
+        .for_each(|(values, output_flags)| {
+            for (&value, flag) in values.iter().zip(output_flags) {
+                *flag = u32::from(predicate.matches(value));
+            }
+        });
 
     let counts = &mut offsets.as_mut_slice()[..chunk_count];
     let mut selected = 0_usize;
@@ -252,13 +252,13 @@ pub fn filter_cpu_parallel(
     }
 
     let mut remaining_output = &mut selection.storage_mut().as_mut_slice()[..selected];
-    thread::scope(|scope| {
+    rayon::scope(|scope| {
         for (chunk_index, flag_chunk) in flags.chunks(chunk_size).enumerate() {
             let output_len = counts[chunk_index] as usize;
             let (output, remaining) = remaining_output.split_at_mut(output_len);
             remaining_output = remaining;
             let row_start = chunk_index * chunk_size;
-            scope.spawn(move || {
+            scope.spawn(move |_| {
                 let mut output_index = 0;
                 for (offset, &flag) in flag_chunk.iter().enumerate() {
                     if flag != 0 {
@@ -381,6 +381,55 @@ pub fn filter_cuda<'a>(
     })
 }
 
+/// A GPU producer used to establish input provenance in crossover benchmarks.
+#[must_use = "dropping a pending CUDA fill waits for its stream"]
+pub struct PendingFill<'a> {
+    _column: &'a mut Column,
+    stream: &'a CudaStream,
+    completed: bool,
+}
+
+impl PendingFill<'_> {
+    pub fn wait(mut self) -> Result<()> {
+        self.stream.synchronize()?;
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingFill<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.stream.synchronize();
+        }
+    }
+}
+
+pub fn fill_mod_u32<'a>(
+    column: &'a mut Column,
+    modulus: u32,
+    stream: &'a CudaStream,
+) -> Result<PendingFill<'a>> {
+    // SAFETY: the pending result retains exclusive access to `column` until
+    // the stream completes the fill kernel.
+    unsafe {
+        cuda_result(
+            "sparkalog_fill_mod_u32",
+            sparkalog_fill_mod_u32(
+                column.as_mut_ptr(),
+                column.len(),
+                modulus,
+                stream.raw.as_ptr(),
+            ),
+        )?;
+    }
+    Ok(PendingFill {
+        _column: column,
+        stream,
+        completed: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,5 +506,19 @@ mod tests {
             .wait()
             .unwrap();
         assert!(workspace.selection().is_empty());
+    }
+
+    #[test]
+    fn gpu_fill_produces_the_expected_pattern() {
+        let mut column = input(&[0; 257]);
+        let stream = CudaStream::new().unwrap();
+
+        fill_mod_u32(&mut column, 17, &stream)
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let expected = (0..257).map(|index| index % 17).collect::<Vec<_>>();
+        assert_eq!(column.as_slice(), expected);
     }
 }

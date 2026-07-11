@@ -6,6 +6,7 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
+rayon = "1.11"
 sparkalog-relational = { path = "../sparkalog-relational" }
 sparkalog-storage = { path = "../sparkalog-storage" }
 

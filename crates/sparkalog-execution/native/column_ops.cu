@@ -39,6 +39,14 @@ __global__ void mark_filter_u32(
     }
 }
 
+__global__ void fill_mod_u32(std::uint32_t* output, std::size_t len, std::uint32_t modulus) {
+    const auto start = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    for (auto index = start; index < len; index += stride) {
+        output[index] = static_cast<std::uint32_t>(index % modulus);
+    }
+}
+
 }  // namespace
 
 extern "C" cudaError_t sparkalog_add_one_i32(
@@ -128,4 +136,23 @@ extern "C" cudaError_t sparkalog_filter_u32(
         count,
         static_cast<::cuda::std::int64_t>(len),
         static_cast<cudaStream_t>(stream));
+}
+
+extern "C" cudaError_t sparkalog_fill_mod_u32(
+    std::uint32_t* output,
+    std::size_t len,
+    std::uint32_t modulus,
+    void* stream) {
+    if (modulus == 0 || (output == nullptr && len != 0)) {
+        return cudaErrorInvalidValue;
+    }
+    if (len == 0) {
+        return cudaSuccess;
+    }
+
+    constexpr unsigned int threads = 256;
+    const auto blocks = static_cast<unsigned int>((len + threads - 1) / threads);
+    fill_mod_u32<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        output, len, modulus);
+    return cudaGetLastError();
 }

@@ -40,3 +40,19 @@ sparkalog-storage ← sparkalog-execution
 The upper layers are currently boundaries rather than an implemented Datalog
 frontend. The shared-buffer proof now exercises storage and execution without
 coupling either one to Datalog syntax.
+
+## Filter crossover benchmark
+
+The first paired relational operator has serial Rust, parallel Rust, and CUDA
+implementations. Run the full CPU/GPU-provenance crossover matrix with:
+
+```sh
+cargo run --release --bin filter-crossover -- \
+  --output benchmarks/filter-crossover.csv
+```
+
+The producer runs immediately before each timed sample but outside its timing
+window. The measured interval begins when the filter is invoked and ends when
+its compact row-ID selection is available to the CPU. Every sample validates
+the selected cardinality. The full matrix covers 32 through 8,388,608 rows and
+1%, 10%, 50%, and 90% selectivity. Use `--quick` for a short smoke run.
