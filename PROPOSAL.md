@@ -109,6 +109,15 @@ Measure a size- and shape-based threshold for CPU versus GPU operators. This
 must compare whole pipeline time, including producer work and synchronization,
 not only kernel duration.
 
+The first measured filter policy is now recorded in
+`FilterPlacementPolicy::MEASURED_GB10`. It selects CUDA from 131,072 rows for
+CPU-produced input and from 32,768 rows for GPU-produced input. Parallel Rust
+is currently only a CUDA-unavailable fallback from 8,388,608 rows; the filter
+measurements did not show a parallel-CPU region before CUDA became faster.
+This first isolated-operator matrix controls producer provenance but excludes
+the producer's own duration; later pipeline placement measurements must include
+producer work as stated above.
+
 ## Engine structure
 
 Sparkalog is organized as a relational engine with Datalog as a frontend:

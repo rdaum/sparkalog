@@ -41,3 +41,17 @@ The first placement policy should therefore use serial Rust for small filters
 and CUDA for large filters. Parallel Rust remains a useful GPU-unavailable
 fallback, but the data does not support inserting it between those tiers on
 this machine.
+
+## Stored policy
+
+`FilterPlacementPolicy::MEASURED_GB10` records conservative thresholds which
+held across the tested selectivities:
+
+| Input provenance | GPU threshold |
+| --- | ---: |
+| CPU-produced | 131,072 rows |
+| GPU-produced | 32,768 rows |
+
+When CUDA is unavailable, the policy switches from serial to parallel Rust at
+8,388,608 rows. With CUDA available, the measured GPU threshold is reached
+first and parallel Rust is not selected.

@@ -1,5 +1,9 @@
 //! Physical execution, synchronization, and CPU/GPU placement.
 
+mod placement;
+
+pub use placement::{FilterPlacementContext, FilterPlacementPolicy, InputProvenance, Placement};
+
 use rayon::prelude::*;
 use sparkalog_relational::U32Predicate;
 use sparkalog_storage::{Column, ManagedBuffer, OperatorWorkspace};
@@ -41,13 +45,6 @@ unsafe extern "C" {
         modulus: u32,
         stream: *mut c_void,
     ) -> i32;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Placement {
-    CpuSerial,
-    CpuParallel,
-    Gpu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -381,6 +378,31 @@ pub fn filter_cuda<'a>(
     })
 }
 
+/// Execute a filter with the backend selected by a measured policy.
+pub fn filter_auto(
+    column: &Column,
+    predicate: U32Predicate,
+    input_provenance: InputProvenance,
+    workspace: &mut OperatorWorkspace,
+    stream: Option<&CudaStream>,
+    policy: FilterPlacementPolicy,
+) -> Result<Placement> {
+    let placement = policy.place(FilterPlacementContext {
+        rows: column.len(),
+        input_provenance,
+        gpu_available: stream.is_some(),
+    });
+    match placement {
+        Placement::CpuSerial => filter_cpu_serial(column, predicate, workspace)?,
+        Placement::CpuParallel => filter_cpu_parallel(column, predicate, workspace)?,
+        Placement::Gpu => {
+            let stream = stream.expect("GPU placement requires an available CUDA stream");
+            filter_cuda(column, predicate, workspace, stream)?.wait()?;
+        }
+    }
+    Ok(placement)
+}
+
 /// A GPU producer used to establish input provenance in crossover benchmarks.
 #[must_use = "dropping a pending CUDA fill waits for its stream"]
 pub struct PendingFill<'a> {
@@ -520,5 +542,44 @@ mod tests {
 
         let expected = (0..257).map(|index| index % 17).collect::<Vec<_>>();
         assert_eq!(column.as_slice(), expected);
+    }
+
+    #[test]
+    fn automatic_filter_executes_the_selected_backend() {
+        let values = (0..1_024).map(|value| value % 100).collect::<Vec<_>>();
+        let column = input(&values);
+        let predicate = U32Predicate::Lt(10);
+        let expected = expected(&values, predicate);
+        let policy = FilterPlacementPolicy {
+            cpu_produced_gpu_min_rows: 512,
+            gpu_produced_gpu_min_rows: 512,
+            gpu_unavailable_parallel_min_rows: 512,
+        };
+        let stream = CudaStream::new().unwrap();
+        let mut workspace = OperatorWorkspace::new().unwrap();
+
+        let placement = filter_auto(
+            &column,
+            predicate,
+            InputProvenance::Cpu,
+            &mut workspace,
+            None,
+            policy,
+        )
+        .unwrap();
+        assert_eq!(placement, Placement::CpuParallel);
+        assert_eq!(workspace.selection().as_slice(), expected);
+
+        let placement = filter_auto(
+            &column,
+            predicate,
+            InputProvenance::Cpu,
+            &mut workspace,
+            Some(&stream),
+            policy,
+        )
+        .unwrap();
+        assert_eq!(placement, Placement::Gpu);
+        assert_eq!(workspace.selection().as_slice(), expected);
     }
 }
