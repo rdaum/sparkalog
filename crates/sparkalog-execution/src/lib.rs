@@ -47,6 +47,42 @@ unsafe extern "C" {
         modulus: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn sparkalog_join_u32_temporary_bytes(
+        counts: *const u64,
+        offsets: *mut u64,
+        left_rows: usize,
+        temporary_bytes: *mut usize,
+        stream: *mut c_void,
+    ) -> i32;
+    fn sparkalog_join_u32_count(
+        left_keys: *const u32,
+        left_rows: usize,
+        index_keys: *const u32,
+        index_starts: *const u32,
+        unique_keys: usize,
+        counts: *mut u64,
+        offsets: *mut u64,
+        total: *mut u64,
+        temporary: *mut c_void,
+        temporary_bytes: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    fn sparkalog_join_u32_emit(
+        left_keys: *const u32,
+        left_rows: usize,
+        index_keys: *const u32,
+        index_starts: *const u32,
+        index_rows: *const u32,
+        unique_keys: usize,
+        projection0: *const u32,
+        projection0_side: u32,
+        projection1: *const u32,
+        projection1_side: u32,
+        offsets: *const u64,
+        output0: *mut u32,
+        output1: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +284,19 @@ impl ProjectionColumn<'_> {
             Self::Right(column) => column[right_row],
         }
     }
+
+    fn as_ptr(self) -> *const u32 {
+        match self {
+            Self::Left(column) | Self::Right(column) => column.as_ptr(),
+        }
+    }
+
+    fn side(self) -> u32 {
+        match self {
+            Self::Left(_) => 0,
+            Self::Right(_) => 1,
+        }
+    }
 }
 
 fn relation_column<'a>(
@@ -414,6 +463,110 @@ pub fn join_cpu_parallel(
         }
     });
     output.set_len(total)?;
+    Ok(())
+}
+
+/// Execute an indexed binary equality join with CUDA count, scan, and emit
+/// stages. The exact output allocation requires one synchronization between
+/// scan and emit.
+pub fn join_cuda(
+    left: RelationView<'_>,
+    right: RelationView<'_>,
+    right_index: &U32RangeIndex,
+    plan: BinaryEqualityJoin,
+    workspace: &mut JoinWorkspace,
+    stream: &CudaStream,
+) -> Result<()> {
+    let (left_key, index, projection) = join_inputs(left, right, right_index, plan)?;
+    workspace.reserve_outer_rows(left.len())?;
+    workspace.output_mut().clear();
+
+    let mut temporary_bytes = 0;
+    {
+        let (counts, offsets, _, _) = workspace.cuda_count_parts();
+        // SAFETY: the pointers refer to live managed buffers; a null temporary
+        // pointer asks CUB only for the required scan workspace size.
+        unsafe {
+            cuda_result(
+                "cub::DeviceScan::ExclusiveSum(size)",
+                sparkalog_join_u32_temporary_bytes(
+                    counts.as_ptr(),
+                    offsets.as_mut_ptr(),
+                    left.len(),
+                    &mut temporary_bytes,
+                    stream.raw.as_ptr(),
+                ),
+            )?;
+        }
+    }
+    workspace.reserve_temporary_bytes(temporary_bytes)?;
+
+    let count_result = {
+        let (counts, offsets, total, temporary) = workspace.cuda_count_parts();
+        // SAFETY: all inputs and scratch buffers are CUDA-managed and remain
+        // live through the synchronization immediately below.
+        unsafe {
+            cuda_result(
+                "sparkalog_join_u32_count",
+                sparkalog_join_u32_count(
+                    left_key.as_ptr(),
+                    left.len(),
+                    index.keys.as_ptr(),
+                    index.starts.as_ptr(),
+                    index.keys.len(),
+                    counts.as_mut_ptr(),
+                    offsets.as_mut_ptr(),
+                    total.as_mut_ptr(),
+                    temporary.as_mut_ptr().cast(),
+                    temporary_bytes,
+                    stream.raw.as_ptr(),
+                ),
+            )
+        }
+    };
+    if let Err(error) = count_result {
+        let _ = stream.synchronize();
+        return Err(error);
+    }
+    stream.synchronize()?;
+    let total_u64 = workspace.total().as_slice()[0];
+    let total = usize::try_from(total_u64).map_err(|_| Error::OutputTooLarge(total_u64))?;
+    workspace.reserve_output_rows(total)?;
+
+    let emit_result = {
+        let (output, offsets) = workspace.emit_parts();
+        let (first, second) = output.columns_mut().split_at_mut(1);
+        // SAFETY: output columns have `total` initialized slots, offsets were
+        // completed by the synchronized count stage, and every emitted range
+        // is disjoint by construction.
+        unsafe {
+            cuda_result(
+                "sparkalog_join_u32_emit",
+                sparkalog_join_u32_emit(
+                    left_key.as_ptr(),
+                    left.len(),
+                    index.keys.as_ptr(),
+                    index.starts.as_ptr(),
+                    index.rows.as_ptr(),
+                    index.keys.len(),
+                    projection[0].as_ptr(),
+                    projection[0].side(),
+                    projection[1].as_ptr(),
+                    projection[1].side(),
+                    offsets.as_ptr(),
+                    first[0].as_mut_ptr(),
+                    second[0].as_mut_ptr(),
+                    stream.raw.as_ptr(),
+                ),
+            )
+        }
+    };
+    if let Err(error) = emit_result {
+        let _ = stream.synchronize();
+        return Err(error);
+    }
+    stream.synchronize()?;
+    workspace.output_mut().set_len(total)?;
     Ok(())
 }
 
@@ -885,6 +1038,43 @@ mod tests {
         );
         assert_eq!(
             parallel.output().view().column_slice(1),
+            serial.output().view().column_slice(1)
+        );
+    }
+
+    #[test]
+    fn cuda_indexed_join_matches_native_output() {
+        let left = relation2(&[(10, 1), (20, 2), (30, 1), (40, 9)]);
+        let right = relation2(&[(1, 100), (1, 101), (2, 200), (3, 300)]);
+        let index = U32RangeIndex::build(right.column(0).unwrap()).unwrap();
+        let stream = CudaStream::new().unwrap();
+        let mut serial = JoinWorkspace::new(2).unwrap();
+        let mut gpu = JoinWorkspace::new(2).unwrap();
+
+        join_cpu_serial(
+            left.view(),
+            right.view(),
+            &index,
+            path_join_plan(),
+            &mut serial,
+        )
+        .unwrap();
+        join_cuda(
+            left.view(),
+            right.view(),
+            &index,
+            path_join_plan(),
+            &mut gpu,
+            &stream,
+        )
+        .unwrap();
+
+        assert_eq!(
+            gpu.output().view().column_slice(0),
+            serial.output().view().column_slice(0)
+        );
+        assert_eq!(
+            gpu.output().view().column_slice(1),
             serial.output().view().column_slice(1)
         );
     }

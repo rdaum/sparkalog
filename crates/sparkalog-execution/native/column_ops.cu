@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cub/device/device_scan.cuh>
 #include <cub/device/device_select.cuh>
 #include <thrust/iterator/counting_iterator.h>
 
@@ -44,6 +45,90 @@ __global__ void fill_mod_u32(std::uint32_t* output, std::size_t len, std::uint32
     const auto stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
     for (auto index = start; index < len; index += stride) {
         output[index] = static_cast<std::uint32_t>(index % modulus);
+    }
+}
+
+__device__ std::int64_t find_index_key(
+    const std::uint32_t* keys,
+    std::size_t unique_keys,
+    std::uint32_t key) {
+    std::size_t left = 0;
+    std::size_t right = unique_keys;
+    while (left < right) {
+        const auto middle = left + (right - left) / 2;
+        const auto candidate = keys[middle];
+        if (candidate < key) {
+            left = middle + 1;
+        } else {
+            right = middle;
+        }
+    }
+    if (left < unique_keys && keys[left] == key) {
+        return static_cast<std::int64_t>(left);
+    }
+    return -1;
+}
+
+__global__ void count_join_u32(
+    const std::uint32_t* left_keys,
+    std::size_t left_rows,
+    const std::uint32_t* index_keys,
+    const std::uint32_t* index_starts,
+    std::size_t unique_keys,
+    std::uint64_t* counts) {
+    const auto start = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    for (auto row = start; row < left_rows; row += stride) {
+        const auto index = find_index_key(index_keys, unique_keys, left_keys[row]);
+        counts[row] = index < 0
+            ? 0
+            : static_cast<std::uint64_t>(index_starts[index + 1] - index_starts[index]);
+    }
+}
+
+__global__ void finish_join_count(
+    const std::uint64_t* counts,
+    const std::uint64_t* offsets,
+    std::size_t left_rows,
+    std::uint64_t* total) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *total = left_rows == 0 ? 0 : offsets[left_rows - 1] + counts[left_rows - 1];
+    }
+}
+
+__global__ void emit_join_u32(
+    const std::uint32_t* left_keys,
+    std::size_t left_rows,
+    const std::uint32_t* index_keys,
+    const std::uint32_t* index_starts,
+    const std::uint32_t* index_rows,
+    std::size_t unique_keys,
+    const std::uint32_t* projection0,
+    std::uint32_t projection0_side,
+    const std::uint32_t* projection1,
+    std::uint32_t projection1_side,
+    const std::uint64_t* offsets,
+    std::uint32_t* output0,
+    std::uint32_t* output1) {
+    const auto start = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    for (auto left_row = start; left_row < left_rows; left_row += stride) {
+        const auto index = find_index_key(index_keys, unique_keys, left_keys[left_row]);
+        if (index < 0) {
+            continue;
+        }
+        const auto match_start = index_starts[index];
+        const auto match_end = index_starts[index + 1];
+        for (auto match = match_start; match < match_end; ++match) {
+            const auto right_row = index_rows[match];
+            const auto output_row = offsets[left_row] + (match - match_start);
+            output0[output_row] = projection0_side == 0
+                ? projection0[left_row]
+                : projection0[right_row];
+            output1[output_row] = projection1_side == 0
+                ? projection1[left_row]
+                : projection1[right_row];
+        }
     }
 }
 
@@ -154,5 +239,112 @@ extern "C" cudaError_t sparkalog_fill_mod_u32(
     const auto blocks = static_cast<unsigned int>((len + threads - 1) / threads);
     fill_mod_u32<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
         output, len, modulus);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t sparkalog_join_u32_temporary_bytes(
+    const std::uint64_t* counts,
+    std::uint64_t* offsets,
+    std::size_t left_rows,
+    std::size_t* temporary_bytes,
+    void* stream) {
+    if (temporary_bytes == nullptr || (left_rows != 0 && (counts == nullptr || offsets == nullptr))) {
+        return cudaErrorInvalidValue;
+    }
+    return cub::DeviceScan::ExclusiveSum(
+        nullptr,
+        *temporary_bytes,
+        counts,
+        offsets,
+        static_cast<::cuda::std::int64_t>(left_rows),
+        static_cast<cudaStream_t>(stream));
+}
+
+extern "C" cudaError_t sparkalog_join_u32_count(
+    const std::uint32_t* left_keys,
+    std::size_t left_rows,
+    const std::uint32_t* index_keys,
+    const std::uint32_t* index_starts,
+    std::size_t unique_keys,
+    std::uint64_t* counts,
+    std::uint64_t* offsets,
+    std::uint64_t* total,
+    void* temporary,
+    std::size_t temporary_bytes,
+    void* stream) {
+    if (total == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (left_rows == 0) {
+        return cudaMemsetAsync(total, 0, sizeof(*total), static_cast<cudaStream_t>(stream));
+    }
+    if (left_keys == nullptr || index_keys == nullptr || index_starts == nullptr ||
+        counts == nullptr || offsets == nullptr || temporary == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr unsigned int threads = 256;
+    const auto blocks = static_cast<unsigned int>((left_rows + threads - 1) / threads);
+    count_join_u32<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        left_keys, left_rows, index_keys, index_starts, unique_keys, counts);
+    auto status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        return status;
+    }
+    status = cub::DeviceScan::ExclusiveSum(
+        temporary,
+        temporary_bytes,
+        counts,
+        offsets,
+        static_cast<::cuda::std::int64_t>(left_rows),
+        static_cast<cudaStream_t>(stream));
+    if (status != cudaSuccess) {
+        return status;
+    }
+    finish_join_count<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+        counts, offsets, left_rows, total);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t sparkalog_join_u32_emit(
+    const std::uint32_t* left_keys,
+    std::size_t left_rows,
+    const std::uint32_t* index_keys,
+    const std::uint32_t* index_starts,
+    const std::uint32_t* index_rows,
+    std::size_t unique_keys,
+    const std::uint32_t* projection0,
+    std::uint32_t projection0_side,
+    const std::uint32_t* projection1,
+    std::uint32_t projection1_side,
+    const std::uint64_t* offsets,
+    std::uint32_t* output0,
+    std::uint32_t* output1,
+    void* stream) {
+    if (left_rows == 0) {
+        return cudaSuccess;
+    }
+    if (left_keys == nullptr || index_keys == nullptr || index_starts == nullptr ||
+        index_rows == nullptr || projection0 == nullptr || projection1 == nullptr ||
+        offsets == nullptr || output0 == nullptr || output1 == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr unsigned int threads = 256;
+    const auto blocks = static_cast<unsigned int>((left_rows + threads - 1) / threads);
+    emit_join_u32<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        left_keys,
+        left_rows,
+        index_keys,
+        index_starts,
+        index_rows,
+        unique_keys,
+        projection0,
+        projection0_side,
+        projection1,
+        projection1_side,
+        offsets,
+        output0,
+        output1);
     return cudaGetLastError();
 }
