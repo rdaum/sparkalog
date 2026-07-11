@@ -1,0 +1,13 @@
+[package]
+name = "sparkalog-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+sparkalog-storage = { path = "../sparkalog-storage" }
+
+[lints]
+workspace = true
+

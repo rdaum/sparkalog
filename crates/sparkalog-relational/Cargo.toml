@@ -1,0 +1,12 @@
+[package]
+name = "sparkalog-relational"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sparkalog-storage = { path = "../sparkalog-storage" }
+
+[lints]
+workspace = true
+

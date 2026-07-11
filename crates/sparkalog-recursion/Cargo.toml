@@ -1,0 +1,12 @@
+[package]
+name = "sparkalog-recursion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sparkalog-relational = { path = "../sparkalog-relational" }
+
+[lints]
+workspace = true
+
