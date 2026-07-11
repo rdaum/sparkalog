@@ -22,6 +22,7 @@ pub enum Error {
     LengthOverflow,
     LogicalLengthExceedsCapacity { len: usize, capacity: usize },
     MismatchedColumnLength { expected: usize, actual: usize },
+    TooManyRows(usize),
     ZeroSizedType,
 }
 
@@ -40,6 +41,12 @@ impl fmt::Display for Error {
                 formatter,
                 "column length {actual} does not match relation length {expected}"
             ),
+            Self::TooManyRows(rows) => {
+                write!(
+                    formatter,
+                    "{rows} rows cannot be represented by u32 row IDs"
+                )
+            }
             Self::ZeroSizedType => {
                 formatter.write_str("CUDA-managed buffers cannot contain zero-sized types")
             }
@@ -224,6 +231,265 @@ impl<'a> RelationView<'a> {
     pub fn column(self, index: usize) -> Option<&'a Column> {
         self.columns.get(index)
     }
+
+    pub fn column_slice(self, index: usize) -> Option<&'a [u32]> {
+        self.columns
+            .get(index)
+            .map(|column| &column.as_slice()[..self.len])
+    }
+}
+
+/// A capacity-backed relation used for operator output.
+pub struct RelationBuffer {
+    columns: Vec<Column>,
+    len: usize,
+    capacity: usize,
+}
+
+impl RelationBuffer {
+    pub fn with_capacity(arity: usize, capacity: usize) -> Result<Self> {
+        let mut columns = Vec::with_capacity(arity);
+        for _ in 0..arity {
+            columns.push(Column::new_filled(capacity, 0)?);
+        }
+        Ok(Self {
+            columns,
+            len: 0,
+            capacity,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn arity(&self) -> usize {
+        self.columns.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn set_len(&mut self, len: usize) -> Result<()> {
+        if len > self.capacity {
+            return Err(Error::LogicalLengthExceedsCapacity {
+                len,
+                capacity: self.capacity,
+            });
+        }
+        self.len = len;
+        Ok(())
+    }
+
+    pub fn reserve(&mut self, required: usize) -> Result<()> {
+        if required <= self.capacity {
+            return Ok(());
+        }
+        let capacity = required.checked_next_power_of_two().unwrap_or(required);
+        for column in &mut self.columns {
+            *column = Column::new_filled(capacity, 0)?;
+        }
+        self.capacity = capacity;
+        self.len = 0;
+        Ok(())
+    }
+
+    pub fn column(&self, index: usize) -> Option<&Column> {
+        self.columns.get(index)
+    }
+
+    pub fn column_mut(&mut self, index: usize) -> Option<&mut Column> {
+        self.columns.get_mut(index)
+    }
+
+    pub fn columns_mut(&mut self) -> &mut [Column] {
+        &mut self.columns
+    }
+
+    pub fn view(&self) -> RelationView<'_> {
+        RelationView {
+            columns: &self.columns,
+            len: self.len,
+        }
+    }
+}
+
+/// A sparse sorted range index mapping `u32` values to canonical row IDs.
+pub struct U32RangeIndex {
+    keys: ManagedBuffer<u32>,
+    starts: ManagedBuffer<u32>,
+    rows: ManagedBuffer<u32>,
+    source_rows: usize,
+}
+
+impl U32RangeIndex {
+    pub fn build(column: &Column) -> Result<Self> {
+        let source_rows = column.len();
+        if source_rows > u32::MAX as usize {
+            return Err(Error::TooManyRows(source_rows));
+        }
+        let mut rows = ManagedBuffer::new_filled(source_rows, 0_u32)?;
+        for (row, output) in rows.as_mut_slice().iter_mut().enumerate() {
+            *output = row as u32;
+        }
+        let values = column.as_slice();
+        rows.as_mut_slice()
+            .sort_unstable_by_key(|&row| (values[row as usize], row));
+
+        let unique = rows
+            .as_slice()
+            .windows(2)
+            .filter(|pair| values[pair[0] as usize] != values[pair[1] as usize])
+            .count()
+            + usize::from(source_rows != 0);
+        let mut keys = ManagedBuffer::new_filled(unique, 0_u32)?;
+        let mut starts = ManagedBuffer::new_filled(unique + 1, 0_u32)?;
+        let mut key_index = 0;
+        for (sorted_position, &row) in rows.as_slice().iter().enumerate() {
+            let key = values[row as usize];
+            if sorted_position == 0 || keys.as_slice()[key_index - 1] != key {
+                keys.as_mut_slice()[key_index] = key;
+                starts.as_mut_slice()[key_index] = sorted_position as u32;
+                key_index += 1;
+            }
+        }
+        starts.as_mut_slice()[unique] = source_rows as u32;
+        Ok(Self {
+            keys,
+            starts,
+            rows,
+            source_rows,
+        })
+    }
+
+    pub fn source_rows(&self) -> usize {
+        self.source_rows
+    }
+
+    pub fn unique_keys(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn keys(&self) -> &ManagedBuffer<u32> {
+        &self.keys
+    }
+
+    pub fn starts(&self) -> &ManagedBuffer<u32> {
+        &self.starts
+    }
+
+    pub fn rows(&self) -> &ManagedBuffer<u32> {
+        &self.rows
+    }
+
+    pub fn lookup(&self, key: u32) -> &[u32] {
+        let Ok(index) = self.keys.as_slice().binary_search(&key) else {
+            return &[];
+        };
+        let start = self.starts.as_slice()[index] as usize;
+        let end = self.starts.as_slice()[index + 1] as usize;
+        &self.rows.as_slice()[start..end]
+    }
+}
+
+/// Reusable count, offset, output, and temporary storage for binary joins.
+pub struct JoinWorkspace {
+    output: RelationBuffer,
+    counts: ManagedBuffer<u64>,
+    offsets: ManagedBuffer<u64>,
+    total: ManagedBuffer<u64>,
+    temporary: ManagedBuffer<u8>,
+}
+
+impl JoinWorkspace {
+    pub fn new(output_arity: usize) -> Result<Self> {
+        Ok(Self {
+            output: RelationBuffer::with_capacity(output_arity, 0)?,
+            counts: ManagedBuffer::new_filled(0, 0_u64)?,
+            offsets: ManagedBuffer::new_filled(0, 0_u64)?,
+            total: ManagedBuffer::new_filled(1, 0_u64)?,
+            temporary: ManagedBuffer::new_filled(0, 0_u8)?,
+        })
+    }
+
+    pub fn reserve_outer_rows(&mut self, required: usize) -> Result<()> {
+        reserve_managed_u64(&mut self.counts, required)?;
+        reserve_managed_u64(&mut self.offsets, required)?;
+        Ok(())
+    }
+
+    pub fn reserve_output_rows(&mut self, required: usize) -> Result<()> {
+        self.output.reserve(required)
+    }
+
+    pub fn reserve_temporary_bytes(&mut self, required: usize) -> Result<()> {
+        if required > self.temporary.len() {
+            let capacity = required.checked_next_power_of_two().unwrap_or(required);
+            self.temporary = ManagedBuffer::new_filled(capacity, 0_u8)?;
+        }
+        Ok(())
+    }
+
+    pub fn output(&self) -> &RelationBuffer {
+        &self.output
+    }
+
+    pub fn output_mut(&mut self) -> &mut RelationBuffer {
+        &mut self.output
+    }
+
+    pub fn counts(&self) -> &ManagedBuffer<u64> {
+        &self.counts
+    }
+
+    pub fn counts_mut(&mut self) -> &mut ManagedBuffer<u64> {
+        &mut self.counts
+    }
+
+    pub fn offsets(&self) -> &ManagedBuffer<u64> {
+        &self.offsets
+    }
+
+    pub fn offsets_mut(&mut self) -> &mut ManagedBuffer<u64> {
+        &mut self.offsets
+    }
+
+    pub fn total(&self) -> &ManagedBuffer<u64> {
+        &self.total
+    }
+
+    pub fn total_mut(&mut self) -> &mut ManagedBuffer<u64> {
+        &mut self.total
+    }
+
+    pub fn temporary_mut(&mut self) -> &mut ManagedBuffer<u8> {
+        &mut self.temporary
+    }
+
+    pub fn cuda_count_parts(
+        &mut self,
+    ) -> (
+        &mut ManagedBuffer<u64>,
+        &mut ManagedBuffer<u64>,
+        &mut ManagedBuffer<u64>,
+        &mut ManagedBuffer<u8>,
+    ) {
+        (
+            &mut self.counts,
+            &mut self.offsets,
+            &mut self.total,
+            &mut self.temporary,
+        )
+    }
 }
 
 /// Compact row identifiers backed by a reusable managed allocation.
@@ -402,6 +668,15 @@ fn reserve_managed(buffer: &mut ManagedBuffer<u32>, required: usize) -> Result<(
     Ok(())
 }
 
+fn reserve_managed_u64(buffer: &mut ManagedBuffer<u64>, required: usize) -> Result<()> {
+    if required <= buffer.len() {
+        return Ok(());
+    }
+    let capacity = required.checked_next_power_of_two().unwrap_or(required);
+    *buffer = ManagedBuffer::new_filled(capacity, 0_u64)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +746,34 @@ mod tests {
         assert_eq!(workspace.selection().storage().as_ptr(), selection);
         assert_eq!(workspace.flags().as_ptr(), flags);
         assert_eq!(workspace.offsets().as_ptr(), offsets);
+    }
+
+    #[test]
+    fn sparse_range_index_returns_canonical_rows() {
+        let mut column = Column::new_filled(6, 0).unwrap();
+        column
+            .as_mut_slice()
+            .copy_from_slice(&[90, 7, 90, 42, 7, 90]);
+        let index = U32RangeIndex::build(&column).unwrap();
+
+        assert_eq!(index.unique_keys(), 3);
+        assert_eq!(index.lookup(7), &[1, 4]);
+        assert_eq!(index.lookup(42), &[3]);
+        let mut rows = index.lookup(90).to_vec();
+        rows.sort_unstable();
+        assert_eq!(rows, [0, 2, 5]);
+        assert!(index.lookup(8).is_empty());
+    }
+
+    #[test]
+    fn relation_buffer_separates_length_and_capacity() {
+        let mut output = RelationBuffer::with_capacity(2, 4).unwrap();
+        output.columns_mut()[0].as_mut_slice()[..2].copy_from_slice(&[1, 2]);
+        output.columns_mut()[1].as_mut_slice()[..2].copy_from_slice(&[3, 4]);
+        output.set_len(2).unwrap();
+
+        assert_eq!(output.view().column_slice(0).unwrap(), &[1, 2]);
+        assert_eq!(output.view().column_slice(1).unwrap(), &[3, 4]);
+        assert_eq!(output.capacity(), 4);
     }
 }

@@ -1,6 +1,8 @@
 //! Backend-neutral relational algebra over Sparkalog's canonical storage.
 
-pub use sparkalog_storage::{Column, Relation, RelationView, Selection};
+pub use sparkalog_storage::{
+    Column, JoinWorkspace, Relation, RelationBuffer, RelationView, Selection, U32RangeIndex,
+};
 
 /// The semi-naive view of a logical relation consumed by an operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -21,6 +23,26 @@ pub struct ColumnRef {
 pub struct JoinKey {
     pub left: ColumnRef,
     pub right: ColumnRef,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JoinInput {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JoinProjection {
+    pub input: JoinInput,
+    pub column: u32,
+}
+
+/// A single-key equality join with a binary projected output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BinaryEqualityJoin {
+    pub left_key: u32,
+    pub right_key: u32,
+    pub output: [JoinProjection; 2],
 }
 
 /// A comparison over one canonical `u32` column.
