@@ -292,6 +292,7 @@ pub struct OperatorWorkspace {
     flags: ManagedBuffer<u32>,
     offsets: ManagedBuffer<u32>,
     count: ManagedBuffer<u32>,
+    temporary: ManagedBuffer<u8>,
 }
 
 impl OperatorWorkspace {
@@ -301,6 +302,7 @@ impl OperatorWorkspace {
             flags: ManagedBuffer::new_filled(0, 0)?,
             offsets: ManagedBuffer::new_filled(0, 0)?,
             count: ManagedBuffer::new_filled(1, 0)?,
+            temporary: ManagedBuffer::new_filled(0, 0)?,
         })
     }
 
@@ -308,6 +310,15 @@ impl OperatorWorkspace {
         self.selection.reserve(required)?;
         reserve_managed(&mut self.flags, required)?;
         reserve_managed(&mut self.offsets, required)?;
+        Ok(())
+    }
+
+    pub fn reserve_temporary_bytes(&mut self, required: usize) -> Result<()> {
+        if required <= self.temporary.len() {
+            return Ok(());
+        }
+        let capacity = required.checked_next_power_of_two().unwrap_or(required);
+        self.temporary = ManagedBuffer::new_filled(capacity, 0)?;
         Ok(())
     }
 
@@ -341,6 +352,40 @@ impl OperatorWorkspace {
 
     pub fn count_mut(&mut self) -> &mut ManagedBuffer<u32> {
         &mut self.count
+    }
+
+    pub fn temporary(&self) -> &ManagedBuffer<u8> {
+        &self.temporary
+    }
+
+    pub fn temporary_mut(&mut self) -> &mut ManagedBuffer<u8> {
+        &mut self.temporary
+    }
+
+    pub fn cpu_compaction_parts(
+        &mut self,
+    ) -> (
+        &mut Selection,
+        &mut ManagedBuffer<u32>,
+        &mut ManagedBuffer<u32>,
+    ) {
+        (&mut self.selection, &mut self.flags, &mut self.offsets)
+    }
+
+    pub fn cuda_compaction_parts(
+        &mut self,
+    ) -> (
+        &mut Selection,
+        &mut ManagedBuffer<u32>,
+        &mut ManagedBuffer<u32>,
+        &mut ManagedBuffer<u8>,
+    ) {
+        (
+            &mut self.selection,
+            &mut self.flags,
+            &mut self.count,
+            &mut self.temporary,
+        )
     }
 }
 

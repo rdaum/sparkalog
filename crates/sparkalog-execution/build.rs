@@ -8,6 +8,7 @@ fn main() {
     let cuda_root = PathBuf::from(cuda_root);
     let nvcc = cuda_root.join("bin/nvcc");
     let include = cuda_root.join("targets/sbsa-linux/include");
+    let cccl_include = include.join("cccl");
     let lib = cuda_root.join("targets/sbsa-linux/lib");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     let object = out_dir.join("column_ops.o");
@@ -21,6 +22,8 @@ fn main() {
             "-I",
         ])
         .arg(&include)
+        .arg("-I")
+        .arg(&cccl_include)
         .args(["-c", "native/column_ops.cu", "-o"])
         .arg(&object)
         .status()
