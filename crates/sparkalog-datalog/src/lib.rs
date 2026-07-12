@@ -9,6 +9,7 @@ mod catalog;
 mod parser;
 mod resolve;
 mod schedule;
+mod subset;
 
 pub use ast::{
     ResolvedAtom, ResolvedLiteral, ResolvedProgram, ResolvedRule, ResolvedTerm, SourceAtom,
@@ -22,6 +23,10 @@ pub use parser::{Diagnostic, ParseOutput, parse_program};
 pub use resolve::{ResolveOutput, resolve_program};
 pub use schedule::{
     ProgramSchedule, ScheduledScc, ScheduledStratum, StratificationError, dependencies, stratify,
+};
+pub use subset::{
+    BinaryExecution, BinaryExecutionError, BinaryProgramPlan, BinarySccPlan, BinarySeedPlan,
+    LoweringError, execute_binary, lower_binary,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
