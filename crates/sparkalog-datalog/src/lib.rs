@@ -6,6 +6,7 @@
 
 mod ast;
 mod catalog;
+mod general;
 mod parser;
 mod resolve;
 mod schedule;
@@ -18,6 +19,10 @@ pub use ast::{
 pub use catalog::{
     CatalogError, InternedValue, PredicateCatalog, PredicateId, PredicateMetadata, ProgramCatalog,
     ValueCatalog, ValueId,
+};
+pub use general::{
+    GeneralExecution, GeneralExecutionError, GeneralSccSummary, TupleStore, execute_general,
+    lower_general,
 };
 pub use parser::{Diagnostic, ParseOutput, parse_program};
 pub use resolve::{ResolveOutput, resolve_program};

@@ -88,6 +88,55 @@ pub struct RecursiveSccPlan {
     pub rules: Vec<RecursiveRulePlan>,
 }
 
+/// A rule-local binding carried through a general relational clause plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BindingId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlanTerm {
+    Binding(BindingId),
+    Value(u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedAtom {
+    pub relation: RelationId,
+    pub version: RelationVersion,
+    pub terms: Vec<PlanTerm>,
+}
+
+/// A backend-neutral conjunction and projection. Positive atoms form a join
+/// chain; negative atoms are evaluated as anti-joins after bindings exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalClausePlan {
+    pub target: RelationId,
+    pub head: Vec<PlanTerm>,
+    pub positive: Vec<PlannedAtom>,
+    pub negative: Vec<PlannedAtom>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneralSccPlan {
+    pub relations: Vec<RelationId>,
+    pub recursive: bool,
+    pub seeds: Vec<RelationalClausePlan>,
+    pub recursive_variants: Vec<RelationalClausePlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneralStratumPlan {
+    pub index: usize,
+    pub sccs: Vec<GeneralSccPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneralProgramPlan {
+    pub predicate_count: usize,
+    pub facts: Vec<(RelationId, Vec<u32>)>,
+    pub strata: Vec<GeneralStratumPlan>,
+    pub outputs: Vec<RelationId>,
+}
+
 /// A comparison over one canonical `u32` column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum U32Predicate {
@@ -149,5 +198,21 @@ mod tests {
         assert!(U32Predicate::Gt(4).matches(5));
         assert!(!U32Predicate::Gt(4).matches(4));
         assert!(U32Predicate::Ge(4).matches(4));
+    }
+
+    #[test]
+    fn general_clause_plan_distinguishes_full_and_delta_inputs() {
+        let plan = RelationalClausePlan {
+            target: RelationId(0),
+            head: vec![PlanTerm::Binding(BindingId(0))],
+            positive: vec![PlannedAtom {
+                relation: RelationId(0),
+                version: RelationVersion::Delta,
+                terms: vec![PlanTerm::Binding(BindingId(0))],
+            }],
+            negative: vec![],
+        };
+
+        assert_eq!(plan.positive[0].version, RelationVersion::Delta);
     }
 }
