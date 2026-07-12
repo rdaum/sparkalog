@@ -37,9 +37,9 @@ sparkalog-storage ← sparkalog-execution
 - `sparkalog-datalog` owns parsing, validation, stratification, and lowering.
 - `sparkalog` is the executable integration boundary.
 
-The upper layers are currently boundaries rather than an implemented Datalog
-frontend. The shared-buffer proof now exercises storage and execution without
-coupling either one to Datalog syntax.
+The Datalog frontend remains a boundary. The recursion layer now has a complete
+semi-naive transitive-closure step and terminating fixpoint driver over the
+storage, relational, and execution layers without coupling them to syntax.
 
 ## Filter crossover benchmark
 
@@ -139,3 +139,15 @@ and CUDA uses CUB device merge followed by unique compaction. The recursion
 crate now combines join, distinct, anti-join, and union in
 `TransitiveClosureStep`; two instances can be ping-ponged so one step consumes
 the prior step's canonical `NEWT` and `FULL` without copying them.
+
+Run the terminating driver over a generated chain graph with automatic,
+CPU-only, or GPU-only placement:
+
+```sh
+cargo run --release --bin tc-fixpoint -- --vertices 128 --backend auto
+```
+
+The driver retains the static `edge` range index, alternates two step
+workspaces, and stops when `NEWT` is empty. `--max-iterations` provides an
+explicit safety bound. The harness verifies the chain's exact
+`vertices * (vertices - 1) / 2` transitive closure before reporting timings.

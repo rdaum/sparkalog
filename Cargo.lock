@@ -82,6 +82,7 @@ name = "sparkalog"
 version = "0.1.0"
 dependencies = [
  "sparkalog-execution",
+ "sparkalog-recursion",
  "sparkalog-relational",
  "sparkalog-storage",
 ]

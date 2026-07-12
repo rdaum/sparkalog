@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 sparkalog-execution = { path = "../sparkalog-execution" }
 sparkalog-relational = { path = "../sparkalog-relational" }
+sparkalog-recursion = { path = "../sparkalog-recursion" }
 sparkalog-storage = { path = "../sparkalog-storage" }
 
 [[bin]]
@@ -36,6 +37,10 @@ path = "src/bin/anti-join-crossover.rs"
 [[bin]]
 name = "union-crossover"
 path = "src/bin/union-crossover.rs"
+
+[[bin]]
+name = "tc-fixpoint"
+path = "src/bin/tc-fixpoint.rs"
 
 [lints]
 workspace = true

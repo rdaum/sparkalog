@@ -115,8 +115,11 @@ merge, a parallel chunked merge, and CUDA mark/compact. Sorted `FULL` union
 `NEWT` is implemented with serial merge, parallel merge-path partitions, and
 CUDA device merge/unique. `TransitiveClosureStep` in the recursion crate now
 executes one complete join, distinct, anti-join, and union sequence. Two step
-workspaces can be ping-ponged without copying canonical outputs; the remaining
-recursion work is the terminating loop and buffer rotation around those steps.
+workspaces are ping-ponged by `FixpointDriver` without copying canonical
+outputs. The CPU scheduler terminates when `NEWT` is empty and enforces an
+explicit iteration limit. The `edge` join index remains static across this
+transitive-closure loop; `FULL` is consumed as a sorted relation by anti-join
+and union rather than rebuilt as a join index.
 
 ### 3. Placement policy
 
@@ -220,6 +223,31 @@ cargo run --release
 
 Set `CUDA_HOME` (or `CUDA_PATH`) when CUDA is not installed at
 `/usr/local/cuda-13.0`.
+
+## CUDA Graph direction
+
+The current fixpoint cannot be captured unchanged as one static CUDA graph.
+Join synchronizes after its count/scan phase to reserve an exact output, every
+operator publishes a host-visible logical length, and CUB dispatch receives
+host `num_items` values which change each iteration. Automatic placement can
+also change processor as `DELTA` grows or shrinks.
+
+A useful first CUDA Graph target is one warmed GPU iteration, not the entire
+fixpoint:
+
+1. Preallocate bounded capacities and all CUB scratch before capture.
+2. Add device-resident logical lengths and capacity-overflow flags.
+3. Let downstream GPU stages consume device counts without intermediate host
+   observation or allocation.
+4. Capture the fixed join, distinct, anti-join, and union topology.
+5. Launch that graph once per GPU-resident iteration; the CPU reads only the
+   final `NEWT` count to decide whether to launch again.
+
+CUDA conditional graph nodes could eventually move the termination decision
+onto the device, but only after dynamic item counts and overflow handling no
+longer require host intervention. The CPU-driven `FixpointDriver` is therefore
+the correctness and performance baseline against which graph capture should
+be measured.
 
 [spark-memory]: https://docs.nvidia.com/dgx/dgx-spark-porting-guide/overview.html
 [gdlog]: https://github.com/harp-lab/gdlog

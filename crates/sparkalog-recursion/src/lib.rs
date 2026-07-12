@@ -148,6 +148,162 @@ impl TransitiveClosureStep {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepSlot {
+    First,
+    Second,
+}
+
+#[derive(Debug)]
+pub enum FixpointError {
+    Execution(sparkalog_execution::Error),
+    IterationLimit {
+        limit: usize,
+        remaining_delta_rows: usize,
+    },
+}
+
+impl std::fmt::Display for FixpointError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Execution(error) => error.fmt(formatter),
+            Self::IterationLimit {
+                limit,
+                remaining_delta_rows,
+            } => write!(
+                formatter,
+                "fixpoint did not converge within {limit} iterations; {remaining_delta_rows} delta rows remain"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FixpointError {}
+
+impl From<sparkalog_execution::Error> for FixpointError {
+    fn from(error: sparkalog_execution::Error) -> Self {
+        Self::Execution(error)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixpointSummary {
+    pub state: FixpointState,
+    pub full_provenance: InputProvenance,
+    pub last_iteration: IterationResult,
+}
+
+/// CPU-scheduled semi-naive fixpoint driver. Two step workspaces alternate so
+/// each iteration can borrow the prior iteration's canonical outputs directly.
+pub struct FixpointDriver {
+    first: TransitiveClosureStep,
+    second: TransitiveClosureStep,
+    final_slot: Option<StepSlot>,
+}
+
+impl FixpointDriver {
+    pub fn new() -> sparkalog_storage::Result<Self> {
+        Ok(Self {
+            first: TransitiveClosureStep::new()?,
+            second: TransitiveClosureStep::new()?,
+            final_slot: None,
+        })
+    }
+
+    pub fn full(&self) -> Option<&RelationBuffer> {
+        match self.final_slot {
+            Some(StepSlot::First) => Some(self.first.full()),
+            Some(StepSlot::Second) => Some(self.second.full()),
+            None => None,
+        }
+    }
+
+    pub fn newt(&self) -> Option<&RelationBuffer> {
+        match self.final_slot {
+            Some(StepSlot::First) => Some(self.first.newt()),
+            Some(StepSlot::Second) => Some(self.second.newt()),
+            None => None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &mut self,
+        seed_delta: RelationView<'_>,
+        edge: RelationView<'_>,
+        seed_full: RelationView<'_>,
+        edge_index: &U32RangeIndex,
+        seed_full_provenance: InputProvenance,
+        stream: Option<&CudaStream>,
+        policies: IterationPolicies,
+        max_iterations: usize,
+    ) -> Result<FixpointSummary, FixpointError> {
+        self.final_slot = None;
+        if max_iterations == 0 {
+            return Err(FixpointError::IterationLimit {
+                limit: 0,
+                remaining_delta_rows: seed_delta.len(),
+            });
+        }
+
+        let mut last_iteration = self.first.execute(
+            seed_delta,
+            edge,
+            seed_full,
+            edge_index,
+            seed_full_provenance,
+            stream,
+            policies,
+        )?;
+        let mut state = FixpointState::with_seed(seed_full.len(), seed_delta.len());
+        state.advance(last_iteration.newt_rows);
+        debug_assert_eq!(state.full_rows(), last_iteration.full_rows);
+        let mut slot = StepSlot::First;
+
+        while !state.reached_fixpoint() {
+            if state.iterations() >= max_iterations {
+                return Err(FixpointError::IterationLimit {
+                    limit: max_iterations,
+                    remaining_delta_rows: state.delta_rows(),
+                });
+            }
+            last_iteration = match slot {
+                StepSlot::First => self.second.execute(
+                    self.first.newt().view(),
+                    edge,
+                    self.first.full().view(),
+                    edge_index,
+                    last_iteration.full_provenance,
+                    stream,
+                    policies,
+                )?,
+                StepSlot::Second => self.first.execute(
+                    self.second.newt().view(),
+                    edge,
+                    self.second.full().view(),
+                    edge_index,
+                    last_iteration.full_provenance,
+                    stream,
+                    policies,
+                )?,
+            };
+            slot = match slot {
+                StepSlot::First => StepSlot::Second,
+                StepSlot::Second => StepSlot::First,
+            };
+            state.advance(last_iteration.newt_rows);
+            debug_assert_eq!(state.full_rows(), last_iteration.full_rows);
+        }
+
+        self.final_slot = Some(slot);
+        Ok(FixpointSummary {
+            state,
+            full_provenance: last_iteration.full_provenance,
+            last_iteration,
+        })
+    }
+}
+
 fn placement_provenance(placement: Placement) -> InputProvenance {
     match placement {
         Placement::Gpu => InputProvenance::Gpu,
@@ -211,9 +367,13 @@ pub struct FixpointState {
 
 impl FixpointState {
     pub fn seeded(seed_rows: usize) -> Self {
+        Self::with_seed(seed_rows, seed_rows)
+    }
+
+    pub fn with_seed(full_rows: usize, delta_rows: usize) -> Self {
         Self {
-            full_rows: seed_rows,
-            delta_rows: seed_rows,
+            full_rows,
+            delta_rows,
             iterations: 0,
         }
     }
@@ -253,6 +413,31 @@ mod tests {
             relation.column_mut(1).unwrap().as_mut_slice()[row] = second;
         }
         relation
+    }
+
+    fn forced_gpu_policies() -> IterationPolicies {
+        IterationPolicies {
+            join: JoinPlacementPolicy {
+                gpu_min_delta_rows: 0,
+                gpu_unavailable_parallel_min_rows: usize::MAX,
+            },
+            distinct: DistinctPlacementPolicy {
+                cpu_produced_gpu_min_rows: 0,
+                gpu_produced_gpu_min_rows: 0,
+                gpu_unavailable_parallel_min_rows: usize::MAX,
+            },
+            anti_join: AntiJoinPlacementPolicy {
+                cpu_produced_gpu_min_rows: 0,
+                gpu_produced_gpu_min_rows: 0,
+                cpu_produced_parallel_min_rows: usize::MAX,
+                gpu_produced_parallel_min_rows: usize::MAX,
+            },
+            union: UnionPlacementPolicy {
+                cpu_produced_gpu_min_rows: 0,
+                gpu_produced_gpu_min_rows: 0,
+                gpu_unavailable_parallel_min_rows: usize::MAX,
+            },
+        }
     }
 
     #[test]
@@ -303,5 +488,92 @@ mod tests {
         state.advance(result.newt_rows);
         assert_eq!(state.full_rows(), result.full_rows);
         assert_eq!(state.delta_rows(), result.newt_rows);
+    }
+
+    #[test]
+    fn fixpoint_driver_converges_with_cpu_and_cuda_execution() {
+        let edge = relation2(&[(1, 2), (2, 3), (3, 4), (4, 5)]);
+        let index = U32RangeIndex::build(edge.column(0).unwrap()).unwrap();
+        let expected_first = [1, 1, 1, 1, 2, 2, 2, 3, 3, 4];
+        let expected_second = [2, 3, 4, 5, 3, 4, 5, 4, 5, 5];
+
+        let mut cpu = FixpointDriver::new().unwrap();
+        let cpu_summary = cpu
+            .run(
+                edge.view(),
+                edge.view(),
+                edge.view(),
+                &index,
+                InputProvenance::Cpu,
+                None,
+                IterationPolicies::default(),
+                16,
+            )
+            .unwrap();
+        assert_eq!(cpu_summary.state.iterations(), 4);
+        assert_eq!(cpu_summary.state.full_rows(), 10);
+        assert!(cpu_summary.state.reached_fixpoint());
+        assert!(cpu.newt().unwrap().is_empty());
+        assert_eq!(
+            cpu.full().unwrap().view().column_slice(0).unwrap(),
+            expected_first
+        );
+        assert_eq!(
+            cpu.full().unwrap().view().column_slice(1).unwrap(),
+            expected_second
+        );
+
+        let stream = CudaStream::new().unwrap();
+        let mut gpu = FixpointDriver::new().unwrap();
+        let gpu_summary = gpu
+            .run(
+                edge.view(),
+                edge.view(),
+                edge.view(),
+                &index,
+                InputProvenance::Cpu,
+                Some(&stream),
+                forced_gpu_policies(),
+                16,
+            )
+            .unwrap();
+        assert_eq!(gpu_summary.state, cpu_summary.state);
+        assert_eq!(gpu_summary.full_provenance, InputProvenance::Gpu);
+        assert_eq!(
+            gpu.full().unwrap().view().column_slice(0),
+            cpu.full().unwrap().view().column_slice(0)
+        );
+        assert_eq!(
+            gpu.full().unwrap().view().column_slice(1),
+            cpu.full().unwrap().view().column_slice(1)
+        );
+    }
+
+    #[test]
+    fn fixpoint_driver_reports_iteration_limit() {
+        let edge = relation2(&[(1, 2), (2, 3), (3, 4), (4, 5)]);
+        let index = U32RangeIndex::build(edge.column(0).unwrap()).unwrap();
+        let mut driver = FixpointDriver::new().unwrap();
+
+        let error = driver
+            .run(
+                edge.view(),
+                edge.view(),
+                edge.view(),
+                &index,
+                InputProvenance::Cpu,
+                None,
+                IterationPolicies::default(),
+                2,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FixpointError::IterationLimit {
+                limit: 2,
+                remaining_delta_rows: 2
+            }
+        ));
     }
 }
