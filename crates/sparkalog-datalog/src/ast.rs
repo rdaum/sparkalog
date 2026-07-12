@@ -124,6 +124,75 @@ pub struct ResolvedProgram {
     pub outputs: Vec<PredicateId>,
 }
 
+impl std::fmt::Display for SourceValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::U32(value) => value.fmt(formatter),
+            Self::String(value) => write!(formatter, "{value:?}"),
+            Self::Symbol(value) => write!(formatter, "'{value}"),
+        }
+    }
+}
+
+impl std::fmt::Display for SourceTerm {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Variable(name) => name.fmt(formatter),
+            Self::Constant(value) => value.fmt(formatter),
+        }
+    }
+}
+
+impl std::fmt::Display for SourceAtom {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}(", self.predicate.value)?;
+        for (index, term) in self.terms.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            term.value.fmt(formatter)?;
+        }
+        formatter.write_str(")")
+    }
+}
+
+impl std::fmt::Display for SourceLiteral {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.negated {
+            formatter.write_str("!")?;
+        }
+        self.atom.fmt(formatter)
+    }
+}
+
+impl std::fmt::Display for SourceRule {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.head.fmt(formatter)?;
+        if !self.body.is_empty() {
+            formatter.write_str(" :- ")?;
+            for (index, literal) in self.body.iter().enumerate() {
+                if index > 0 {
+                    formatter.write_str(", ")?;
+                }
+                literal.fmt(formatter)?;
+            }
+        }
+        formatter.write_str(".")
+    }
+}
+
+impl std::fmt::Display for SourceProgram {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for rule in &self.rules {
+            writeln!(formatter, "{rule}")?;
+        }
+        for output in &self.outputs {
+            writeln!(formatter, ".output {}", output.value)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

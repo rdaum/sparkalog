@@ -6,6 +6,7 @@
 
 mod ast;
 mod catalog;
+mod parser;
 
 pub use ast::{
     ResolvedAtom, ResolvedLiteral, ResolvedProgram, ResolvedRule, ResolvedTerm, SourceAtom,
@@ -15,6 +16,7 @@ pub use catalog::{
     CatalogError, InternedValue, PredicateCatalog, PredicateId, PredicateMetadata, ProgramCatalog,
     ValueCatalog, ValueId,
 };
+pub use parser::{Diagnostic, ParseOutput, parse_program};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DependencyKind {
