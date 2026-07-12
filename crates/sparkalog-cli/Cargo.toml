@@ -33,5 +33,9 @@ path = "src/bin/distinct-crossover.rs"
 name = "anti-join-crossover"
 path = "src/bin/anti-join-crossover.rs"
 
+[[bin]]
+name = "union-crossover"
+path = "src/bin/union-crossover.rs"
+
 [lints]
 workspace = true

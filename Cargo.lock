@@ -107,7 +107,9 @@ dependencies = [
 name = "sparkalog-recursion"
 version = "0.1.0"
 dependencies = [
+ "sparkalog-execution",
  "sparkalog-relational",
+ "sparkalog-storage",
 ]
 
 [[package]]

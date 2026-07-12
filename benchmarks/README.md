@@ -142,3 +142,28 @@ input. The stored fallback thresholds are respectively 32,768 and 262,144
 rows. For the full first step, anti-join reduced 4,908,681 distinct candidates
 to 4,285,010 `NEWT` tuples. CUDA took 1.358 ms, parallel Rust 3.218 ms, and
 serial Rust 11.294 ms for CPU-produced input.
+
+# DBLP sorted union crossover
+
+`union-crossover.csv` measures `FULL union NEWT` after regenerating the complete
+join, distinct, and anti-join pipeline outside each timed interval. Both input
+relations are sorted and disjoint by construction, though every union backend
+also removes duplicate keys. Exact canonical output is checked against serial
+Rust before timings are accepted.
+
+Serial Rust performs a direct sorted merge. Parallel Rust packs keys and uses
+merge-path partitions before unique compaction. CUDA packs the same `u64`
+lexicographic keys, uses CUB device-wide merge and unique, and unpacks the
+result into two managed `u32` columns.
+
+This DBLP workload starts with a 1,049,866-row `FULL`, so even the smallest
+measured union contains 1,050,539 total input rows. CUDA won that case at
+0.430 ms versus 1.868 ms for serial Rust on CPU-produced input, and remained
+fastest throughout. The full first update produced 5,334,876 `FULL` tuples;
+CUDA took 2.149 ms, parallel Rust 9.616 ms, and serial Rust 12.606 ms.
+
+`UnionPlacementPolicy::MEASURED_GB10_DBLP` therefore selects CUDA from
+1,048,576 total input rows for either producer. Smaller unions remain on serial
+Rust because this real workload did not measure them. Without CUDA, parallel
+Rust is selected from 4,194,304 total rows, where its advantage became
+consistent enough to use as a conservative fallback.

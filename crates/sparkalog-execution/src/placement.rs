@@ -173,6 +173,47 @@ impl AntiJoinPlacementPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnionPlacementContext {
+    pub left_rows: usize,
+    pub right_rows: usize,
+    pub input_provenance: InputProvenance,
+    pub gpu_available: bool,
+}
+
+/// Total-cardinality thresholds for sorted binary union.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnionPlacementPolicy {
+    pub cpu_produced_gpu_min_rows: usize,
+    pub gpu_produced_gpu_min_rows: usize,
+    pub gpu_unavailable_parallel_min_rows: usize,
+}
+
+impl UnionPlacementPolicy {
+    /// Conservative bounds from `benchmarks/union-crossover.csv`, recorded for
+    /// DBLP `FULL union NEWT` updates on the local GB10.
+    pub const MEASURED_GB10_DBLP: Self = Self {
+        cpu_produced_gpu_min_rows: 1_048_576,
+        gpu_produced_gpu_min_rows: 1_048_576,
+        gpu_unavailable_parallel_min_rows: 4_194_304,
+    };
+
+    pub fn place(self, context: UnionPlacementContext) -> Placement {
+        let rows = context.left_rows.saturating_add(context.right_rows);
+        let gpu_min_rows = match context.input_provenance {
+            InputProvenance::Cpu => self.cpu_produced_gpu_min_rows,
+            InputProvenance::Gpu => self.gpu_produced_gpu_min_rows,
+        };
+        if context.gpu_available && rows >= gpu_min_rows {
+            Placement::Gpu
+        } else if !context.gpu_available && rows >= self.gpu_unavailable_parallel_min_rows {
+            Placement::CpuParallel
+        } else {
+            Placement::CpuSerial
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +372,38 @@ mod tests {
             policy.place(AntiJoinPlacementContext {
                 left_rows: 262_144,
                 input_provenance: InputProvenance::Gpu,
+                gpu_available: false,
+            }),
+            Placement::CpuParallel
+        );
+    }
+
+    #[test]
+    fn measured_union_policy_uses_total_merge_cardinality() {
+        let policy = UnionPlacementPolicy::MEASURED_GB10_DBLP;
+        assert_eq!(
+            policy.place(UnionPlacementContext {
+                left_rows: 1_000_000,
+                right_rows: 40_000,
+                input_provenance: InputProvenance::Cpu,
+                gpu_available: true,
+            }),
+            Placement::CpuSerial
+        );
+        assert_eq!(
+            policy.place(UnionPlacementContext {
+                left_rows: 1_000_000,
+                right_rows: 50_000,
+                input_provenance: InputProvenance::Gpu,
+                gpu_available: true,
+            }),
+            Placement::Gpu
+        );
+        assert_eq!(
+            policy.place(UnionPlacementContext {
+                left_rows: 2_000_000,
+                right_rows: 2_194_304,
+                input_provenance: InputProvenance::Cpu,
                 gpu_available: false,
             }),
             Placement::CpuParallel

@@ -2,6 +2,7 @@
 #include <cub/device/device_scan.cuh>
 #include <cub/device/device_select.cuh>
 #include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_merge.cuh>
 #include <thrust/iterator/counting_iterator.h>
 
 #include <cstddef>
@@ -636,5 +637,139 @@ extern "C" cudaError_t sparkalog_anti_join_u32(
         left_rows,
         output_first,
         output_second);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t sparkalog_union_u32_temporary_bytes(
+    const std::uint64_t* left,
+    std::size_t left_rows,
+    const std::uint64_t* right,
+    std::size_t right_rows,
+    std::uint64_t* merged,
+    std::uint64_t* unique,
+    std::uint64_t* unique_rows,
+    std::size_t* temporary_bytes,
+    void* stream) {
+    const auto total = left_rows + right_rows;
+    if (temporary_bytes == nullptr || unique_rows == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if ((left_rows != 0 && left == nullptr) || (right_rows != 0 && right == nullptr) ||
+        (total != 0 && (merged == nullptr || unique == nullptr))) {
+        return cudaErrorInvalidValue;
+    }
+
+    std::size_t merge_bytes = 0;
+    auto status = cub::DeviceMerge::MergeKeys(
+        nullptr,
+        merge_bytes,
+        left,
+        static_cast<::cuda::std::int64_t>(left_rows),
+        right,
+        static_cast<::cuda::std::int64_t>(right_rows),
+        merged,
+        ::cuda::std::less<>{},
+        static_cast<cudaStream_t>(stream));
+    if (status != cudaSuccess) {
+        return status;
+    }
+    std::size_t unique_bytes = 0;
+    status = cub::DeviceSelect::Unique(
+        nullptr,
+        unique_bytes,
+        merged,
+        unique,
+        unique_rows,
+        static_cast<::cuda::std::int64_t>(total),
+        static_cast<cudaStream_t>(stream));
+    if (status != cudaSuccess) {
+        return status;
+    }
+    *temporary_bytes = merge_bytes > unique_bytes ? merge_bytes : unique_bytes;
+    return cudaSuccess;
+}
+
+extern "C" cudaError_t sparkalog_union_u32(
+    const std::uint32_t* left_first,
+    const std::uint32_t* left_second,
+    std::size_t left_rows,
+    const std::uint32_t* right_first,
+    const std::uint32_t* right_second,
+    std::size_t right_rows,
+    std::uint64_t* left,
+    std::uint64_t* right,
+    std::uint64_t* merged,
+    std::uint64_t* unique,
+    std::uint64_t* unique_rows,
+    std::uint32_t* output_first,
+    std::uint32_t* output_second,
+    void* temporary,
+    std::size_t temporary_bytes,
+    void* stream) {
+    const auto total = left_rows + right_rows;
+    if (unique_rows == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (total == 0) {
+        return cudaMemsetAsync(
+            unique_rows, 0, sizeof(*unique_rows), static_cast<cudaStream_t>(stream));
+    }
+    if ((left_rows != 0 &&
+         (left_first == nullptr || left_second == nullptr || left == nullptr)) ||
+        (right_rows != 0 &&
+         (right_first == nullptr || right_second == nullptr || right == nullptr)) ||
+        merged == nullptr || unique == nullptr || output_first == nullptr ||
+        output_second == nullptr || temporary == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr unsigned int threads = 256;
+    if (left_rows != 0) {
+        const auto blocks = static_cast<unsigned int>((left_rows + threads - 1) / threads);
+        pack_binary_u32<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+            left_first, left_second, left_rows, left);
+        auto status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            return status;
+        }
+    }
+    if (right_rows != 0) {
+        const auto blocks = static_cast<unsigned int>((right_rows + threads - 1) / threads);
+        pack_binary_u32<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+            right_first, right_second, right_rows, right);
+        auto status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            return status;
+        }
+    }
+    std::size_t available = temporary_bytes;
+    auto status = cub::DeviceMerge::MergeKeys(
+        temporary,
+        available,
+        left,
+        static_cast<::cuda::std::int64_t>(left_rows),
+        right,
+        static_cast<::cuda::std::int64_t>(right_rows),
+        merged,
+        ::cuda::std::less<>{},
+        static_cast<cudaStream_t>(stream));
+    if (status != cudaSuccess) {
+        return status;
+    }
+    available = temporary_bytes;
+    status = cub::DeviceSelect::Unique(
+        temporary,
+        available,
+        merged,
+        unique,
+        unique_rows,
+        static_cast<::cuda::std::int64_t>(total),
+        static_cast<cudaStream_t>(stream));
+    if (status != cudaSuccess) {
+        return status;
+    }
+    const auto blocks = static_cast<unsigned int>((total + threads - 1) / threads);
+    unpack_binary_u32<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        unique, unique_rows, total, output_first, output_second);
     return cudaGetLastError();
 }

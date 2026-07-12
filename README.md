@@ -126,3 +126,16 @@ merge, parallel Rust uses merge-count and merge-emit passes over left chunks,
 and CUDA uses parallel membership marking plus CUB stable compaction. Inputs
 are regenerated immediately before every timed sample with either the native
 or CUDA join/distinct pipeline, and all outputs are checked exactly.
+
+Merge `NEWT` into the sorted `FULL` relation with:
+
+```sh
+cargo run --release --bin union-crossover -- \
+  --output benchmarks/union-crossover.csv
+```
+
+Serial Rust performs a sorted merge, parallel Rust uses merge-path partitions,
+and CUDA uses CUB device merge followed by unique compaction. The recursion
+crate now combines join, distinct, anti-join, and union in
+`TransitiveClosureStep`; two instances can be ping-ponged so one step consumes
+the prior step's canonical `NEWT` and `FULL` without copying them.

@@ -747,6 +747,103 @@ impl AntiJoinWorkspace {
     }
 }
 
+/// Reusable managed storage for sorted binary union.
+pub struct UnionWorkspace {
+    output: RelationBuffer,
+    left: ManagedBuffer<u64>,
+    right: ManagedBuffer<u64>,
+    merged: ManagedBuffer<u64>,
+    unique: ManagedBuffer<u64>,
+    count: ManagedBuffer<u64>,
+    temporary: ManagedBuffer<u8>,
+}
+
+pub struct UnionCudaParts<'a> {
+    pub output: &'a mut RelationBuffer,
+    pub left: &'a mut ManagedBuffer<u64>,
+    pub right: &'a mut ManagedBuffer<u64>,
+    pub merged: &'a mut ManagedBuffer<u64>,
+    pub unique: &'a mut ManagedBuffer<u64>,
+    pub count: &'a mut ManagedBuffer<u64>,
+    pub temporary: &'a mut ManagedBuffer<u8>,
+}
+
+impl UnionWorkspace {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            output: RelationBuffer::with_capacity(2, 0)?,
+            left: ManagedBuffer::new_filled(0, 0_u64)?,
+            right: ManagedBuffer::new_filled(0, 0_u64)?,
+            merged: ManagedBuffer::new_filled(0, 0_u64)?,
+            unique: ManagedBuffer::new_filled(0, 0_u64)?,
+            count: ManagedBuffer::new_filled(1, 0_u64)?,
+            temporary: ManagedBuffer::new_filled(0, 0_u8)?,
+        })
+    }
+
+    pub fn reserve_rows(&mut self, left: usize, right: usize) -> Result<()> {
+        let total = left.checked_add(right).ok_or(Error::LengthOverflow)?;
+        self.output.reserve(total)?;
+        reserve_managed_u64(&mut self.left, left)?;
+        reserve_managed_u64(&mut self.right, right)?;
+        reserve_managed_u64(&mut self.merged, total)?;
+        reserve_managed_u64(&mut self.unique, total)?;
+        Ok(())
+    }
+
+    pub fn reserve_temporary_bytes(&mut self, required: usize) -> Result<()> {
+        if required > self.temporary.len() {
+            let capacity = required.checked_next_power_of_two().unwrap_or(required);
+            self.temporary = ManagedBuffer::new_filled(capacity, 0_u8)?;
+        }
+        Ok(())
+    }
+
+    pub fn output(&self) -> &RelationBuffer {
+        &self.output
+    }
+
+    pub fn output_mut(&mut self) -> &mut RelationBuffer {
+        &mut self.output
+    }
+
+    pub fn count(&self) -> &ManagedBuffer<u64> {
+        &self.count
+    }
+
+    pub fn count_mut(&mut self) -> &mut ManagedBuffer<u64> {
+        &mut self.count
+    }
+
+    pub fn cpu_parts(
+        &mut self,
+    ) -> (
+        &mut RelationBuffer,
+        &mut ManagedBuffer<u64>,
+        &mut ManagedBuffer<u64>,
+        &mut ManagedBuffer<u64>,
+    ) {
+        (
+            &mut self.output,
+            &mut self.left,
+            &mut self.right,
+            &mut self.merged,
+        )
+    }
+
+    pub fn cuda_parts(&mut self) -> UnionCudaParts<'_> {
+        UnionCudaParts {
+            output: &mut self.output,
+            left: &mut self.left,
+            right: &mut self.right,
+            merged: &mut self.merged,
+            unique: &mut self.unique,
+            count: &mut self.count,
+            temporary: &mut self.temporary,
+        }
+    }
+}
+
 /// Compact row identifiers backed by a reusable managed allocation.
 pub struct Selection {
     rows: ManagedBuffer<u32>,
@@ -1072,6 +1169,17 @@ mod tests {
 
         workspace.reserve_rows(8).unwrap();
         workspace.reserve_chunks(3).unwrap();
+
+        assert_eq!(workspace.output().column(0).unwrap().as_ptr(), output);
+    }
+
+    #[test]
+    fn union_workspace_reuses_sufficient_allocations() {
+        let mut workspace = UnionWorkspace::new().unwrap();
+        workspace.reserve_rows(6, 4).unwrap();
+        let output = workspace.output().column(0).unwrap().as_ptr();
+
+        workspace.reserve_rows(5, 3).unwrap();
 
         assert_eq!(workspace.output().column(0).unwrap().as_ptr(), output);
     }

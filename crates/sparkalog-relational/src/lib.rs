@@ -2,7 +2,7 @@
 
 pub use sparkalog_storage::{
     AntiJoinWorkspace, Column, DistinctWorkspace, JoinWorkspace, Relation, RelationBuffer,
-    RelationView, Selection, U32RangeIndex,
+    RelationView, Selection, U32RangeIndex, UnionWorkspace,
 };
 
 /// The semi-naive view of a logical relation consumed by an operator.
@@ -55,6 +55,13 @@ pub struct BinaryDistinct {
 /// Set difference between two lexicographically sorted binary relations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SortedBinaryAntiJoin {
+    pub left: [u32; 2],
+    pub right: [u32; 2],
+}
+
+/// Set union of two lexicographically sorted binary relations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SortedBinaryUnion {
     pub left: [u32; 2],
     pub right: [u32; 2],
 }

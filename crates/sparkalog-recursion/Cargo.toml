@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+sparkalog-execution = { path = "../sparkalog-execution" }
 sparkalog-relational = { path = "../sparkalog-relational" }
+sparkalog-storage = { path = "../sparkalog-storage" }
 
 [lints]
 workspace = true
-

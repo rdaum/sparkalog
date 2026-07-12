@@ -5,17 +5,18 @@ mod placement;
 pub use placement::{
     AntiJoinPlacementContext, AntiJoinPlacementPolicy, DistinctPlacementContext,
     DistinctPlacementPolicy, FilterPlacementContext, FilterPlacementPolicy, InputProvenance,
-    JoinPlacementContext, JoinPlacementPolicy, Placement,
+    JoinPlacementContext, JoinPlacementPolicy, Placement, UnionPlacementContext,
+    UnionPlacementPolicy,
 };
 
 use rayon::prelude::*;
 use sparkalog_relational::{
     BinaryDistinct, BinaryEqualityJoin, JoinInput, JoinProjection, SortedBinaryAntiJoin,
-    U32Predicate,
+    SortedBinaryUnion, U32Predicate,
 };
 use sparkalog_storage::{
     AntiJoinWorkspace, Column, DistinctWorkspace, JoinWorkspace, ManagedBuffer, OperatorWorkspace,
-    RelationView, U32BitmapIndex, U32RangeIndex,
+    RelationBuffer, RelationView, U32BitmapIndex, U32RangeIndex, UnionWorkspace,
 };
 use std::ffi::c_void;
 use std::fmt;
@@ -130,6 +131,35 @@ unsafe extern "C" {
         flags: *mut u32,
         selected: *mut u32,
         selected_rows: *mut u32,
+        output_first: *mut u32,
+        output_second: *mut u32,
+        temporary: *mut c_void,
+        temporary_bytes: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    fn sparkalog_union_u32_temporary_bytes(
+        left: *const u64,
+        left_rows: usize,
+        right: *const u64,
+        right_rows: usize,
+        merged: *mut u64,
+        unique: *mut u64,
+        unique_rows: *mut u64,
+        temporary_bytes: *mut usize,
+        stream: *mut c_void,
+    ) -> i32;
+    fn sparkalog_union_u32(
+        left_first: *const u32,
+        left_second: *const u32,
+        left_rows: usize,
+        right_first: *const u32,
+        right_second: *const u32,
+        right_rows: usize,
+        left: *mut u64,
+        right: *mut u64,
+        merged: *mut u64,
+        unique: *mut u64,
+        unique_rows: *mut u64,
         output_first: *mut u32,
         output_second: *mut u32,
         temporary: *mut c_void,
@@ -332,7 +362,16 @@ fn unpack_distinct_output(
     parallel: bool,
 ) -> Result<()> {
     let (output, packed) = workspace.cpu_output_parts();
-    let packed = &packed.as_slice()[..unique];
+    unpack_packed_output(output, packed.as_slice(), unique, parallel)
+}
+
+fn unpack_packed_output(
+    output: &mut RelationBuffer,
+    packed: &[u64],
+    unique: usize,
+    parallel: bool,
+) -> Result<()> {
+    let packed = &packed[..unique];
     let (first, second) = output.columns_mut().split_at_mut(1);
     let output0 = &mut first[0].as_mut_slice()[..unique];
     let output1 = &mut second[0].as_mut_slice()[..unique];
@@ -867,6 +906,298 @@ pub fn anti_join_auto(
         Placement::Gpu => {
             let stream = stream.expect("GPU placement requires an available CUDA stream");
             anti_join_cuda(left, right, plan, workspace, stream)?.wait()?;
+        }
+    }
+    Ok(placement)
+}
+
+fn union_inputs<'a>(
+    left: RelationView<'a>,
+    right: RelationView<'a>,
+    plan: SortedBinaryUnion,
+) -> Result<(BinaryColumns<'a>, BinaryColumns<'a>)> {
+    check_row_count(left.len())?;
+    check_row_count(right.len())?;
+    Ok((
+        (
+            relation_column(left, "left", plan.left[0])?,
+            relation_column(left, "left", plan.left[1])?,
+        ),
+        (
+            relation_column(right, "right", plan.right[0])?,
+            relation_column(right, "right", plan.right[1])?,
+        ),
+    ))
+}
+
+/// Merge and deduplicate two sorted binary relations on the calling thread.
+pub fn union_cpu_serial(
+    left: RelationView<'_>,
+    right: RelationView<'_>,
+    plan: SortedBinaryUnion,
+    workspace: &mut UnionWorkspace,
+) -> Result<()> {
+    let ((left_first, left_second), (right_first, right_second)) = union_inputs(left, right, plan)?;
+    workspace.reserve_rows(left.len(), right.len())?;
+    workspace.output_mut().clear();
+    let output = workspace.output_mut();
+    let (first, second) = output.columns_mut().split_at_mut(1);
+    let output_first = first[0].as_mut_slice();
+    let output_second = second[0].as_mut_slice();
+    let mut left_row = 0;
+    let mut right_row = 0;
+    let mut written = 0;
+    while left_row < left.len() || right_row < right.len() {
+        let tuple = if right_row == right.len()
+            || (left_row < left.len()
+                && compare_pair(
+                    left_first[left_row],
+                    left_second[left_row],
+                    right_first[right_row],
+                    right_second[right_row],
+                ) != std::cmp::Ordering::Greater)
+        {
+            let tuple = (left_first[left_row], left_second[left_row]);
+            left_row += 1;
+            tuple
+        } else {
+            let tuple = (right_first[right_row], right_second[right_row]);
+            right_row += 1;
+            tuple
+        };
+        if written == 0
+            || output_first[written - 1] != tuple.0
+            || output_second[written - 1] != tuple.1
+        {
+            output_first[written] = tuple.0;
+            output_second[written] = tuple.1;
+            written += 1;
+        }
+    }
+    output.set_len(written)?;
+    Ok(())
+}
+
+fn merge_partition(left: &[u64], right: &[u64], output_position: usize) -> usize {
+    let mut low = output_position.saturating_sub(right.len());
+    let mut high = output_position.min(left.len());
+    while low < high {
+        let left_position = low + (high - low) / 2;
+        let right_position = output_position - left_position;
+        if left_position < left.len()
+            && right_position > 0
+            && right[right_position - 1] > left[left_position]
+        {
+            low = left_position + 1;
+        } else {
+            high = left_position;
+        }
+    }
+    low
+}
+
+fn merge_packed_range(left: &[u64], right: &[u64], output_start: usize, output: &mut [u64]) {
+    let mut left_row = merge_partition(left, right, output_start);
+    let mut right_row = output_start - left_row;
+    for value in output {
+        if right_row == right.len() || (left_row < left.len() && left[left_row] <= right[right_row])
+        {
+            *value = left[left_row];
+            left_row += 1;
+        } else {
+            *value = right[right_row];
+            right_row += 1;
+        }
+    }
+}
+
+/// Merge and deduplicate two sorted binary relations using parallel merge-path
+/// partitions and stable canonical output.
+pub fn union_cpu_parallel(
+    left: RelationView<'_>,
+    right: RelationView<'_>,
+    plan: SortedBinaryUnion,
+    workspace: &mut UnionWorkspace,
+) -> Result<()> {
+    let ((left_first, left_second), (right_first, right_second)) = union_inputs(left, right, plan)?;
+    let total = left
+        .len()
+        .checked_add(right.len())
+        .ok_or(Error::OutputTooLarge(u64::MAX))?;
+    if total == 0 || rayon::current_num_threads() == 1 {
+        return union_cpu_serial(left, right, plan, workspace);
+    }
+    workspace.reserve_rows(left.len(), right.len())?;
+    workspace.output_mut().clear();
+    let workers = rayon::current_num_threads().min(total);
+    let chunk_size = total.div_ceil(workers);
+    let (output, packed_left, packed_right, merged) = workspace.cpu_parts();
+    let packed_left = &mut packed_left.as_mut_slice()[..left.len()];
+    let packed_right = &mut packed_right.as_mut_slice()[..right.len()];
+    rayon::join(
+        || {
+            packed_left
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(row, output)| {
+                    *output = pack_tuple(left_first[row], left_second[row]);
+                });
+        },
+        || {
+            packed_right
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(row, output)| {
+                    *output = pack_tuple(right_first[row], right_second[row]);
+                });
+        },
+    );
+    let packed_left = &*packed_left;
+    let packed_right = &*packed_right;
+    merged.as_mut_slice()[..total]
+        .par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(chunk, output)| {
+            merge_packed_range(packed_left, packed_right, chunk * chunk_size, output);
+        });
+    let merged = &mut merged.as_mut_slice()[..total];
+    let unique = deduplicate_sorted(merged);
+    unpack_packed_output(output, merged, unique, true)
+}
+
+#[must_use = "dropping a pending CUDA union waits for its stream"]
+pub struct PendingUnion<'a> {
+    _left: RelationView<'a>,
+    _right: RelationView<'a>,
+    workspace: &'a mut UnionWorkspace,
+    stream: &'a CudaStream,
+    completed: bool,
+}
+
+impl PendingUnion<'_> {
+    pub fn wait(mut self) -> Result<()> {
+        self.stream.synchronize()?;
+        let unique_u64 = self.workspace.count().as_slice()[0];
+        let unique = usize::try_from(unique_u64).map_err(|_| Error::OutputTooLarge(unique_u64))?;
+        self.workspace.output_mut().set_len(unique)?;
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingUnion<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.stream.synchronize();
+        }
+    }
+}
+
+/// Merge and deduplicate sorted binary relations with CUDA device-wide merge
+/// and unique compaction.
+pub fn union_cuda<'a>(
+    left: RelationView<'a>,
+    right: RelationView<'a>,
+    plan: SortedBinaryUnion,
+    workspace: &'a mut UnionWorkspace,
+    stream: &'a CudaStream,
+) -> Result<PendingUnion<'a>> {
+    let ((left_first, left_second), (right_first, right_second)) = union_inputs(left, right, plan)?;
+    left.len()
+        .checked_add(right.len())
+        .ok_or(Error::OutputTooLarge(u64::MAX))?;
+    workspace.reserve_rows(left.len(), right.len())?;
+    workspace.output_mut().clear();
+    workspace.count_mut().as_mut_slice()[0] = 0;
+
+    let mut temporary_bytes = 0;
+    {
+        let parts = workspace.cuda_parts();
+        // SAFETY: all pointers refer to live managed buffers. A null temporary
+        // pointer asks CUB for the maximum merge/unique workspace requirement.
+        unsafe {
+            cuda_result(
+                "sparkalog_union_u32_temporary_bytes",
+                sparkalog_union_u32_temporary_bytes(
+                    parts.left.as_ptr(),
+                    left.len(),
+                    parts.right.as_ptr(),
+                    right.len(),
+                    parts.merged.as_mut_ptr(),
+                    parts.unique.as_mut_ptr(),
+                    parts.count.as_mut_ptr(),
+                    &mut temporary_bytes,
+                    stream.raw.as_ptr(),
+                ),
+            )?;
+        }
+    }
+    workspace.reserve_temporary_bytes(temporary_bytes)?;
+
+    let launch_result = {
+        let parts = workspace.cuda_parts();
+        let (output0, output1) = parts.output.columns_mut().split_at_mut(1);
+        // SAFETY: the pending result retains both inputs and exclusive output
+        // workspace access until the stream completes.
+        unsafe {
+            cuda_result(
+                "sparkalog_union_u32",
+                sparkalog_union_u32(
+                    left_first.as_ptr(),
+                    left_second.as_ptr(),
+                    left.len(),
+                    right_first.as_ptr(),
+                    right_second.as_ptr(),
+                    right.len(),
+                    parts.left.as_mut_ptr(),
+                    parts.right.as_mut_ptr(),
+                    parts.merged.as_mut_ptr(),
+                    parts.unique.as_mut_ptr(),
+                    parts.count.as_mut_ptr(),
+                    output0[0].as_mut_ptr(),
+                    output1[0].as_mut_ptr(),
+                    parts.temporary.as_mut_ptr().cast(),
+                    temporary_bytes,
+                    stream.raw.as_ptr(),
+                ),
+            )
+        }
+    };
+    if let Err(error) = launch_result {
+        let _ = stream.synchronize();
+        return Err(error);
+    }
+    Ok(PendingUnion {
+        _left: left,
+        _right: right,
+        workspace,
+        stream,
+        completed: false,
+    })
+}
+
+/// Execute sorted binary union using a measured placement policy.
+pub fn union_auto(
+    left: RelationView<'_>,
+    right: RelationView<'_>,
+    plan: SortedBinaryUnion,
+    input_provenance: InputProvenance,
+    workspace: &mut UnionWorkspace,
+    stream: Option<&CudaStream>,
+    policy: UnionPlacementPolicy,
+) -> Result<Placement> {
+    let placement = policy.place(UnionPlacementContext {
+        left_rows: left.len(),
+        right_rows: right.len(),
+        input_provenance,
+        gpu_available: stream.is_some(),
+    });
+    match placement {
+        Placement::CpuSerial => union_cpu_serial(left, right, plan, workspace)?,
+        Placement::CpuParallel => union_cpu_parallel(left, right, plan, workspace)?,
+        Placement::Gpu => {
+            let stream = stream.expect("GPU placement requires an available CUDA stream");
+            union_cuda(left, right, plan, workspace, stream)?.wait()?;
         }
     }
     Ok(placement)
@@ -1673,6 +2004,13 @@ mod tests {
         }
     }
 
+    fn sorted_binary_union_plan() -> SortedBinaryUnion {
+        SortedBinaryUnion {
+            left: [0, 1],
+            right: [0, 1],
+        }
+    }
+
     #[test]
     fn serial_and_parallel_filters_match() {
         let values = (0..10_000).map(|value| value % 97).collect::<Vec<_>>();
@@ -1862,6 +2200,138 @@ mod tests {
         assert_eq!(
             workspace.output().view().column_slice(1).unwrap(),
             &[10, 20, 50]
+        );
+    }
+
+    #[test]
+    fn all_union_backends_merge_and_deduplicate_sorted_pairs() {
+        let left = relation2(&[(1, 10), (2, 20), (2, 20), (4, 40)]);
+        let right = relation2(&[(1, 11), (2, 20), (3, 30), (5, 50)]);
+        let mut serial = UnionWorkspace::new().unwrap();
+        let mut parallel = UnionWorkspace::new().unwrap();
+        let mut gpu = UnionWorkspace::new().unwrap();
+        let stream = CudaStream::new().unwrap();
+
+        union_cpu_serial(
+            left.view(),
+            right.view(),
+            sorted_binary_union_plan(),
+            &mut serial,
+        )
+        .unwrap();
+        union_cpu_parallel(
+            left.view(),
+            right.view(),
+            sorted_binary_union_plan(),
+            &mut parallel,
+        )
+        .unwrap();
+        union_cuda(
+            left.view(),
+            right.view(),
+            sorted_binary_union_plan(),
+            &mut gpu,
+            &stream,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+
+        assert_eq!(
+            serial.output().view().column_slice(0).unwrap(),
+            &[1, 1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            serial.output().view().column_slice(1).unwrap(),
+            &[10, 11, 20, 30, 40, 50]
+        );
+        for output in [parallel.output(), gpu.output()] {
+            assert_eq!(
+                output.view().column_slice(0),
+                serial.output().view().column_slice(0)
+            );
+            assert_eq!(
+                output.view().column_slice(1),
+                serial.output().view().column_slice(1)
+            );
+        }
+    }
+
+    #[test]
+    fn all_union_backends_handle_empty_relations() {
+        let empty = relation2(&[]);
+        let right = relation2(&[(1, 10), (2, 20)]);
+        let stream = CudaStream::new().unwrap();
+        let mut workspace = UnionWorkspace::new().unwrap();
+
+        union_cpu_serial(
+            empty.view(),
+            right.view(),
+            sorted_binary_union_plan(),
+            &mut workspace,
+        )
+        .unwrap();
+        assert_eq!(workspace.output().len(), 2);
+        union_cpu_parallel(
+            right.view(),
+            empty.view(),
+            sorted_binary_union_plan(),
+            &mut workspace,
+        )
+        .unwrap();
+        assert_eq!(workspace.output().len(), 2);
+        union_cuda(
+            empty.view(),
+            empty.view(),
+            sorted_binary_union_plan(),
+            &mut workspace,
+            &stream,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        assert!(workspace.output().is_empty());
+    }
+
+    #[test]
+    fn automatic_union_executes_the_selected_backend() {
+        let left = relation2(&[(1, 10), (2, 20), (4, 40)]);
+        let right = relation2(&[(1, 11), (2, 20), (3, 30)]);
+        let policy = UnionPlacementPolicy {
+            cpu_produced_gpu_min_rows: 1,
+            gpu_produced_gpu_min_rows: 1,
+            gpu_unavailable_parallel_min_rows: 1,
+        };
+        let mut workspace = UnionWorkspace::new().unwrap();
+
+        let placement = union_auto(
+            left.view(),
+            right.view(),
+            sorted_binary_union_plan(),
+            InputProvenance::Cpu,
+            &mut workspace,
+            None,
+            policy,
+        )
+        .unwrap();
+        assert_eq!(placement, Placement::CpuParallel);
+        assert_eq!(workspace.output().len(), 5);
+
+        let stream = CudaStream::new().unwrap();
+        let placement = union_auto(
+            left.view(),
+            right.view(),
+            sorted_binary_union_plan(),
+            InputProvenance::Gpu,
+            &mut workspace,
+            Some(&stream),
+            policy,
+        )
+        .unwrap();
+        assert_eq!(placement, Placement::Gpu);
+        assert_eq!(
+            workspace.output().view().column_slice(0).unwrap(),
+            &[1, 1, 2, 3, 4]
         );
     }
 

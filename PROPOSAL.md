@@ -111,9 +111,12 @@ deduplication are also implemented: a temporary packed `u64` gives serial
 Rust, Rayon parallel sort, and CUDA radix-sort/unique implementations the same
 lexicographic key before results return to canonical `u32` columns. Integration
 The sorted candidate-minus-`FULL` anti-join is now implemented as a serial
-merge, a parallel chunked merge, and CUDA mark/compact. The remaining work for
-the recursive `FULL`/`DELTA`/`NEWT` lifecycle is sorted union/merge plus the
-iteration driver.
+merge, a parallel chunked merge, and CUDA mark/compact. Sorted `FULL` union
+`NEWT` is implemented with serial merge, parallel merge-path partitions, and
+CUDA device merge/unique. `TransitiveClosureStep` in the recursion crate now
+executes one complete join, distinct, anti-join, and union sequence. Two step
+workspaces can be ping-ponged without copying canonical outputs; the remaining
+recursion work is the terminating loop and buffer rotation around those steps.
 
 ### 3. Placement policy
 
@@ -148,6 +151,12 @@ CUDA it selects parallel merge from 32,768 CPU-produced or 262,144 GPU-produced
 rows. In the full first DBLP step, anti-join reduces 4,908,681 candidates to
 4,285,010 `NEWT` tuples in 1.358 ms on CUDA, versus 3.218 ms for parallel Rust
 and 11.294 ms for serial Rust.
+
+`UnionPlacementPolicy::MEASURED_GB10_DBLP` selects CUDA from 1,048,576 total
+merge rows for either producer and parallel Rust from 4,194,304 rows when CUDA
+is unavailable. The full first DBLP update merges 1,049,866 `FULL` rows with
+4,285,010 `NEWT` rows into 5,334,876 rows in 2.149 ms on CUDA, versus 9.616 ms
+for parallel Rust and 12.606 ms for serial Rust.
 
 ## Engine structure
 
