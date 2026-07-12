@@ -37,12 +37,52 @@ sparkalog-storage ← sparkalog-execution
 - `sparkalog-datalog` owns parsing, validation, stratification, and lowering.
 - `sparkalog` is the executable integration boundary.
 
-The Datalog frontend remains a boundary. The recursion layer now executes
-backend-neutral recursive SCC plans over a relation store keyed by relation ID.
-Each recursive relation owns canonical `FULL`, `DELTA`, and `NEWT` buffers;
-multiple clauses for one target are combined and deduplicated before a single
-target-level anti-join, and mutually recursive targets observe the same round.
-Transitive closure is the first plan lowered into that generic path.
+The Datalog frontend is now executable. It parses source with spans and
+recovery, interns predicates and typed values into stable `u32` IDs, validates
+arity and rule safety, rejects negative recursion, schedules strata/SCCs, and
+lowers rules into backend-neutral relational clause plans. The general native
+Rust path supports arbitrary arity, constants, join chains, multiple recursive
+atoms, mutual recursion, and stratified negation. Eligible binary recursive
+programs use the measured native Rust/CUDA operator pipeline over canonical
+managed columns.
+
+## Datalog quick start
+
+```prolog
+edge('a, 'b).
+edge('b, 'c).
+
+path(x, y) :- edge(x, y).
+path(x, z) :- path(x, y), edge(y, z).
+
+.output path
+```
+
+```sh
+cargo run --bin sparkalog -- check examples/transitive-closure.dl
+cargo run --bin sparkalog -- explain examples/transitive-closure.dl
+cargo run --bin sparkalog -- run examples/transitive-closure.dl
+```
+
+Bare terms are rule-local variables. Prefix symbols with an apostrophe, quote
+strings, and write `u32` numbers in decimal. Safe negation uses `!atom(...)`.
+The parser also accepts practical Souffle-style `.decl`, `.input`, and
+`.output` directives; declarations are syntax-compatible hints while resolved
+predicate arity is inferred and checked from facts and rules.
+
+The library-facing `Database` API supports loading and checking a program,
+stable fact insertion, repeatable execution, decoded queries, parallel CSV/TSV
+ingestion, explain output, and catalog persistence through
+`ProgramCatalog::write_to`/`read_from`. Join order is selected from relation
+cardinality estimates while preferring connected atoms, and dead bindings are
+released after their last planned use.
+
+Run the repeatable frontend ingestion/execution smoke benchmark with an
+optional row count:
+
+```sh
+cargo run --release --bin datalog-frontend-smoke -- 100000
+```
 
 ## Filter crossover benchmark
 

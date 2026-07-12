@@ -43,5 +43,9 @@ path = "src/bin/union-crossover.rs"
 name = "tc-fixpoint"
 path = "src/bin/tc-fixpoint.rs"
 
+[[bin]]
+name = "datalog-frontend-smoke"
+path = "src/bin/datalog-frontend-smoke.rs"
+
 [lints]
 workspace = true

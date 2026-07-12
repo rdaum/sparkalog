@@ -25,6 +25,7 @@ pub fn lower_general(program: &ResolvedProgram) -> Result<GeneralProgramPlan, Lo
             std::iter::once(rule.head.predicate)
                 .chain(rule.body.iter().map(|literal| literal.atom.predicate))
         })
+        .chain(program.declarations.iter().copied())
         .chain(program.outputs.iter().copied())
         .map(|id| id.0 as usize + 1)
         .max()
@@ -64,7 +65,7 @@ pub fn lower_general(program: &ResolvedProgram) -> Result<GeneralProgramPlan, Lo
             }
         })
         .collect();
-    Ok(GeneralProgramPlan {
+    let mut plan = GeneralProgramPlan {
         predicate_count,
         facts,
         strata,
@@ -73,7 +74,10 @@ pub fn lower_general(program: &ResolvedProgram) -> Result<GeneralProgramPlan, Lo
             .iter()
             .map(|predicate| relation_id(*predicate))
             .collect(),
-    })
+    };
+    let statistics = PlanStatistics::from_plan(&plan);
+    optimize_general(&mut plan, &statistics);
+    Ok(plan)
 }
 
 fn lower_scc(program: &ResolvedProgram, scc: &ScheduledScc) -> GeneralSccPlan {
@@ -139,6 +143,7 @@ fn lower_clause(rule: &ResolvedRule, delta_position: Option<usize>) -> Relationa
         head: rule.head.terms.iter().copied().map(plan_term).collect(),
         positive,
         negative,
+        live_after: Vec::new(),
     }
 }
 
@@ -159,6 +164,179 @@ fn plan_term(term: ResolvedTerm) -> PlanTerm {
 
 fn relation_id(predicate: PredicateId) -> RelationId {
     RelationId(predicate.0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanStatistics {
+    pub relation_rows: Vec<usize>,
+}
+
+impl PlanStatistics {
+    pub fn from_plan(plan: &GeneralProgramPlan) -> Self {
+        let mut relation_rows = vec![0; plan.predicate_count];
+        for (relation, _) in &plan.facts {
+            relation_rows[relation.0 as usize] += 1;
+        }
+        Self { relation_rows }
+    }
+
+    pub fn rows(&self, relation: RelationId) -> usize {
+        self.relation_rows
+            .get(relation.0 as usize)
+            .copied()
+            .unwrap_or(usize::MAX / 4)
+    }
+}
+
+pub fn optimize_general(plan: &mut GeneralProgramPlan, statistics: &PlanStatistics) {
+    for clause in plan.strata.iter_mut().flat_map(|stratum| {
+        stratum.sccs.iter_mut().flat_map(|scc| {
+            scc.seeds
+                .iter_mut()
+                .chain(scc.recursive_variants.iter_mut())
+        })
+    }) {
+        order_positive_atoms(clause, statistics);
+        clause.live_after = live_bindings(clause);
+    }
+}
+
+fn order_positive_atoms(clause: &mut RelationalClausePlan, statistics: &PlanStatistics) {
+    let mut remaining = std::mem::take(&mut clause.positive);
+    let mut ordered = Vec::with_capacity(remaining.len());
+    let mut bound = HashSet::new();
+    while !remaining.is_empty() {
+        let best = remaining
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, atom)| {
+                let shares_binding = atom.terms.iter().any(
+                    |term| matches!(term, PlanTerm::Binding(binding) if bound.contains(binding)),
+                );
+                (
+                    !bound.is_empty() && !shares_binding,
+                    estimated_atom_rows(atom, statistics),
+                    atom.relation.0,
+                )
+            })
+            .map(|(index, _)| index)
+            .expect("remaining atoms are not empty");
+        let atom = remaining.remove(best);
+        bound.extend(atom.terms.iter().filter_map(|term| match term {
+            PlanTerm::Binding(binding) => Some(*binding),
+            PlanTerm::Value(_) => None,
+        }));
+        ordered.push(atom);
+    }
+    clause.positive = ordered;
+}
+
+fn estimated_atom_rows(atom: &PlannedAtom, statistics: &PlanStatistics) -> usize {
+    let mut estimate = statistics.rows(atom.relation);
+    if estimate == 0 {
+        estimate = usize::MAX / 8;
+    }
+    if atom.version == RelationVersion::Delta {
+        estimate = estimate.saturating_div(4).max(1);
+    }
+    for term in &atom.terms {
+        if matches!(term, PlanTerm::Value(_)) {
+            estimate = estimate.saturating_div(8).max(1);
+        }
+    }
+    estimate
+}
+
+fn live_bindings(clause: &RelationalClausePlan) -> Vec<Vec<BindingId>> {
+    (0..clause.positive.len())
+        .map(|position| {
+            let introduced = clause.positive[..=position]
+                .iter()
+                .flat_map(|atom| &atom.terms)
+                .filter_map(|term| match term {
+                    PlanTerm::Binding(binding) => Some(*binding),
+                    PlanTerm::Value(_) => None,
+                })
+                .collect::<HashSet<_>>();
+            let mut live = clause
+                .head
+                .iter()
+                .chain(clause.negative.iter().flat_map(|atom| atom.terms.iter()))
+                .chain(
+                    clause.positive[position + 1..]
+                        .iter()
+                        .flat_map(|atom| atom.terms.iter()),
+                )
+                .filter_map(|term| match term {
+                    PlanTerm::Binding(binding) => Some(*binding),
+                    PlanTerm::Value(_) => None,
+                })
+                .filter(|binding| introduced.contains(binding))
+                .collect::<Vec<_>>();
+            live.sort_unstable();
+            live.dedup();
+            live
+        })
+        .collect()
+}
+
+pub fn explain_general(plan: &GeneralProgramPlan, catalog: &crate::ProgramCatalog) -> String {
+    use std::fmt::Write;
+
+    let statistics = PlanStatistics::from_plan(plan);
+    let mut output = String::new();
+    for stratum in &plan.strata {
+        writeln!(&mut output, "stratum {}", stratum.index).expect("writing to string");
+        for scc in &stratum.sccs {
+            let names = scc
+                .relations
+                .iter()
+                .map(|relation| relation_name(catalog, *relation))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(
+                &mut output,
+                "  scc [{names}] recursive={} seeds={} variants={}",
+                scc.recursive,
+                scc.seeds.len(),
+                scc.recursive_variants.len()
+            )
+            .expect("writing to string");
+            for clause in scc.seeds.iter().chain(&scc.recursive_variants) {
+                writeln!(
+                    &mut output,
+                    "    {} <- {}",
+                    relation_name(catalog, clause.target),
+                    clause
+                        .positive
+                        .iter()
+                        .map(|atom| format!(
+                            "{}.{:?}[~{}]",
+                            relation_name(catalog, atom.relation),
+                            atom.version,
+                            estimated_atom_rows(atom, &statistics)
+                        ))
+                        .chain(
+                            clause.negative.iter().map(|atom| format!(
+                                "!{}.Full",
+                                relation_name(catalog, atom.relation)
+                            ))
+                        )
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
+                )
+                .expect("writing to string");
+            }
+        }
+    }
+    output
+}
+
+fn relation_name(catalog: &crate::ProgramCatalog, relation: RelationId) -> &str {
+    catalog
+        .predicates
+        .get(PredicateId(relation.0))
+        .map_or("?", |metadata| metadata.name.as_str())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -310,7 +488,7 @@ fn evaluate_clause(clause: &RelationalClausePlan, store: &TupleStore) -> TupleSe
         .max()
         .unwrap_or(0);
     let mut bindings = vec![vec![None; binding_count]];
-    for atom in &clause.positive {
+    for (atom_index, atom) in clause.positive.iter().enumerate() {
         let rows = match atom.version {
             RelationVersion::Full => &store.full[atom.relation.0 as usize],
             RelationVersion::Delta => &store.delta[atom.relation.0 as usize],
@@ -329,6 +507,14 @@ fn evaluate_clause(clause: &RelationalClausePlan, store: &TupleStore) -> TupleSe
             }
         }
         bindings = joined;
+        let live = &clause.live_after[atom_index];
+        for binding in &mut bindings {
+            for (index, slot) in binding.iter_mut().enumerate() {
+                if !live.contains(&BindingId(index as u32)) {
+                    *slot = None;
+                }
+            }
+        }
         if bindings.is_empty() {
             break;
         }
@@ -520,5 +706,32 @@ mod tests {
 
         assert_eq!(clause.negative.len(), 1);
         assert_eq!(clause.negative[0].version, RelationVersion::Full);
+    }
+
+    #[test]
+    fn statistics_order_selective_connected_atoms_and_compute_liveness() {
+        let parsed = parse_program(
+            "large('a, 'b). large('c, 'd). large('e, 'f). small('b). answer(x) :- large(x, y), small(y).",
+        );
+        let mut catalog = ProgramCatalog::new();
+        let resolved = resolve_program(&parsed.program, &mut catalog);
+        let plan = lower_general(&resolved.program).unwrap();
+        let answer = relation_id(catalog.predicates.id("answer").unwrap());
+        let small = relation_id(catalog.predicates.id("small").unwrap());
+        let clause = plan
+            .strata
+            .iter()
+            .flat_map(|stratum| &stratum.sccs)
+            .flat_map(|scc| &scc.seeds)
+            .find(|clause| clause.target == answer)
+            .unwrap();
+
+        assert_eq!(clause.positive[0].relation, small);
+        assert_eq!(clause.live_after.len(), 2);
+        assert_eq!(clause.live_after[0], [BindingId(1)]);
+        assert_eq!(clause.live_after[1], [BindingId(0)]);
+        let explanation = explain_general(&plan, &catalog);
+        assert!(explanation.contains("small.Full"));
+        assert!(explanation.contains("answer <-"));
     }
 }

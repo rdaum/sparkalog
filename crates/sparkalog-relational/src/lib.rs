@@ -113,6 +113,8 @@ pub struct RelationalClausePlan {
     pub head: Vec<PlanTerm>,
     pub positive: Vec<PlannedAtom>,
     pub negative: Vec<PlannedAtom>,
+    /// Bindings retained after each positive atom, computed after join ordering.
+    pub live_after: Vec<Vec<BindingId>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +213,7 @@ mod tests {
                 terms: vec![PlanTerm::Binding(BindingId(0))],
             }],
             negative: vec![],
+            live_after: vec![vec![BindingId(0)]],
         };
 
         assert_eq!(plan.positive[0].version, RelationVersion::Delta);

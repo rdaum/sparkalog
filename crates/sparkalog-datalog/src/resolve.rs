@@ -20,11 +20,58 @@ impl ResolveOutput {
 
 pub fn resolve_program(source: &SourceProgram, catalog: &mut ProgramCatalog) -> ResolveOutput {
     let mut diagnostics = Vec::new();
+    let mut declarations = Vec::with_capacity(source.declarations.len());
+    let mut declared_names = HashSet::new();
+    for declaration in &source.declarations {
+        if !declared_names.insert(declaration.predicate.value.as_str()) {
+            diagnostics.push(Diagnostic {
+                message: format!(
+                    "predicate {} is declared more than once",
+                    declaration.predicate.value
+                ),
+                span: declaration.span,
+            });
+            continue;
+        }
+        match catalog
+            .predicates
+            .declare(&declaration.predicate.value, declaration.arity)
+        {
+            Ok(id) => declarations.push(id),
+            Err(error) => diagnostics.push(catalog_diagnostic(error, declaration.span)),
+        }
+    }
+    let mut inputs = Vec::with_capacity(source.inputs.len());
+    let mut input_names = HashSet::new();
+    for input in &source.inputs {
+        if !input_names.insert(input.value.as_str()) {
+            diagnostics.push(Diagnostic {
+                message: format!("input predicate {} is listed more than once", input.value),
+                span: input.span,
+            });
+            continue;
+        }
+        match catalog.predicates.id(&input.value) {
+            Some(id) if declarations.contains(&id) => inputs.push(id),
+            _ => diagnostics.push(Diagnostic {
+                message: format!("input predicate {} has no declaration", input.value),
+                span: input.span,
+            }),
+        }
+    }
     let mut rules = Vec::with_capacity(source.rules.len());
     for rule in &source.rules {
         match resolve_rule(rule, catalog) {
             Ok(rule) => rules.push(rule),
             Err(mut errors) => diagnostics.append(&mut errors),
+        }
+    }
+    for rule in rules.iter().filter(|rule| !rule.is_fact()) {
+        if inputs.contains(&rule.head.predicate) {
+            diagnostics.push(Diagnostic {
+                message: "an input (EDB) predicate cannot also be derived by a rule".into(),
+                span: rule.head.span,
+            });
         }
     }
     let mut outputs = Vec::with_capacity(source.outputs.len());
@@ -45,7 +92,12 @@ pub fn resolve_program(source: &SourceProgram, catalog: &mut ProgramCatalog) -> 
         }
     }
     ResolveOutput {
-        program: ResolvedProgram { rules, outputs },
+        program: ResolvedProgram {
+            declarations,
+            inputs,
+            rules,
+            outputs,
+        },
         diagnostics,
     }
 }
@@ -280,5 +332,23 @@ mod tests {
 
         assert_eq!(output.program.outputs, []);
         assert!(output.diagnostics[0].message.contains("is not defined"));
+    }
+
+    #[test]
+    fn rejects_duplicate_declarations_and_edb_idb_conflicts() {
+        let parsed = parse_program(
+            ".decl edge(a:symbol, b:symbol) .decl edge(a:symbol, b:symbol) .input edge edge(x, y) :- source(x, y).",
+        );
+        assert_eq!(parsed.diagnostics, []);
+        let mut catalog = ProgramCatalog::new();
+        let output = resolve_program(&parsed.program, &mut catalog);
+
+        assert_eq!(output.diagnostics.len(), 2);
+        assert!(
+            output.diagnostics[0]
+                .message
+                .contains("declared more than once")
+        );
+        assert!(output.diagnostics[1].message.contains("EDB"));
     }
 }

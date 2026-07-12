@@ -203,6 +203,18 @@ Evaluation is bottom-up and semi-naive. Stratified negation lowers to an
 anti-join against a completed relation in an earlier stratum. Negative cycles
 are outside the initial semantics.
 
+The frontend now implements this pipeline end to end. Source and resolved ASTs
+are separate, diagnostics retain byte spans, predicate/value catalogs provide
+stable dense IDs, and signed dependencies produce deterministic strata and
+SCCs. General clauses carry explicit `FULL`/`DELTA` inputs, one semi-naive
+variant per recursive body occurrence, a statistics-ordered positive join
+chain, semantic negative inputs, and per-step binding liveness. A native Rust
+interpreter covers the general plan; binary recursive plans are recognized as
+a whole-pipeline specialization and dispatched through the measured Rust/CUDA
+operators. CSV/TSV ingestion is parsed in parallel before deterministic
+interning, catalogs have a stable persisted representation, and explain output
+shows scheduling, input versions, order, and estimates.
+
 ## Measurements that decide the design
 
 - CPU producer -> GPU consumer latency against an explicit-copy baseline.

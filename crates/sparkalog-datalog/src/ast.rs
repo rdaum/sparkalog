@@ -73,8 +73,17 @@ impl SourceRule {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceProgram {
+    pub declarations: Vec<SourceDeclaration>,
+    pub inputs: Vec<Spanned<String>>,
     pub rules: Vec<SourceRule>,
     pub outputs: Vec<Spanned<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDeclaration {
+    pub predicate: Spanned<String>,
+    pub arity: usize,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -120,6 +129,8 @@ impl ResolvedRule {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedProgram {
+    pub declarations: Vec<PredicateId>,
+    pub inputs: Vec<PredicateId>,
     pub rules: Vec<ResolvedRule>,
     pub outputs: Vec<PredicateId>,
 }
@@ -183,6 +194,19 @@ impl std::fmt::Display for SourceRule {
 
 impl std::fmt::Display for SourceProgram {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for declaration in &self.declarations {
+            write!(formatter, ".decl {}(", declaration.predicate.value)?;
+            for column in 0..declaration.arity {
+                if column > 0 {
+                    formatter.write_str(", ")?;
+                }
+                write!(formatter, "c{column}:symbol")?;
+            }
+            writeln!(formatter, ")")?;
+        }
+        for input in &self.inputs {
+            writeln!(formatter, ".input {}", input.value)?;
+        }
         for rule in &self.rules {
             writeln!(formatter, "{rule}")?;
         }

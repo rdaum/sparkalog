@@ -50,6 +50,7 @@ pub fn stratify(program: &ResolvedProgram) -> Result<ProgramSchedule, Stratifica
             std::iter::once(rule.head.predicate)
                 .chain(rule.body.iter().map(|literal| literal.atom.predicate))
         })
+        .chain(program.declarations.iter().copied())
         .chain(program.outputs.iter().copied())
         .map(|id| id.0 as usize + 1)
         .max()
@@ -63,6 +64,9 @@ pub fn stratify(program: &ResolvedProgram) -> Result<ProgramSchedule, Stratifica
     }
     for &output in &program.outputs {
         active[output.0 as usize] = true;
+    }
+    for &declaration in &program.declarations {
+        active[declaration.0 as usize] = true;
     }
     let mut graph = vec![Vec::new(); predicate_count];
     let mut reverse = vec![Vec::new(); predicate_count];

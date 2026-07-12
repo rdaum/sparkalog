@@ -13,7 +13,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next().unwrap_or_else(|| "help".into());
     match command.as_str() {
-        "run" | "check" => {
+        "run" | "check" | "explain" => {
             let path = arguments
                 .next()
                 .ok_or_else(|| format!("usage: sparkalog {command} FILE"))?;
@@ -23,10 +23,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_file(&command, Path::new(&path))
         }
         "help" | "--help" | "-h" => {
-            println!("usage: sparkalog <run|check> FILE");
+            println!("usage: sparkalog <run|check|explain> FILE");
             Ok(())
         }
-        _ => Err(format!("unknown command {command}; expected run or check").into()),
+        _ => Err(format!("unknown command {command}; expected run, check, or explain").into()),
     }
 }
 
@@ -36,6 +36,10 @@ fn run_file(command: &str, path: &Path) -> Result<(), Box<dyn std::error::Error>
     database.load_program(&source)?;
     if command == "check" {
         println!("{}: valid", path.display());
+        return Ok(());
+    }
+    if command == "explain" {
+        print!("{}", database.explain()?);
         return Ok(());
     }
     let summary = database.run()?;

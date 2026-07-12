@@ -79,6 +79,7 @@ pub fn lower_binary(program: &ResolvedProgram) -> Result<BinaryProgramPlan, Lowe
             std::iter::once(rule.head.predicate)
                 .chain(rule.body.iter().map(|literal| literal.atom.predicate))
         })
+        .chain(program.declarations.iter().copied())
         .chain(program.outputs.iter().copied())
         .map(|id| id.0 as usize + 1)
         .max()

@@ -1,6 +1,13 @@
 use crate::{
-    SourceAtom, SourceLiteral, SourceProgram, SourceRule, SourceTerm, SourceValue, Span, Spanned,
+    SourceAtom, SourceDeclaration, SourceLiteral, SourceProgram, SourceRule, SourceTerm,
+    SourceValue, Span, Spanned,
 };
+
+enum ParsedDirective {
+    Declaration(SourceDeclaration),
+    Input(Spanned<String>),
+    Output(Spanned<String>),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
@@ -57,6 +64,7 @@ enum TokenKind {
     RightParen,
     Comma,
     Dot,
+    Colon,
     ColonDash,
     Bang,
     Invalid,
@@ -101,6 +109,7 @@ fn lex(source: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                     span: Span::new(start, position),
                 });
             }
+            b':' => push_punctuation(&mut tokens, &mut position, TokenKind::Colon),
             b'\'' => {
                 position += 1;
                 let value_start = position;
@@ -256,9 +265,14 @@ impl Parser {
     fn parse_program(&mut self) -> SourceProgram {
         let mut program = SourceProgram::default();
         while !self.is_finished() {
-            let result = if self.at_output_directive() {
-                self.parse_output()
-                    .map(|output| program.outputs.push(output))
+            let result = if self.at_directive() {
+                self.parse_directive().map(|directive| match directive {
+                    ParsedDirective::Declaration(declaration) => {
+                        program.declarations.push(declaration);
+                    }
+                    ParsedDirective::Input(input) => program.inputs.push(input),
+                    ParsedDirective::Output(output) => program.outputs.push(output),
+                })
             } else {
                 self.parse_rule().map(|rule| program.rules.push(rule))
             };
@@ -357,21 +371,60 @@ impl Parser {
         Ok(Spanned::new(term, token.span))
     }
 
-    fn parse_output(&mut self) -> Result<Spanned<String>, Diagnostic> {
-        self.expect(|kind| matches!(kind, TokenKind::Dot), "expected `.output`")?;
-        let directive = self.expect_ident("expected `output` after `.`")?;
-        if directive.value != "output" {
-            return Err(Diagnostic {
+    fn parse_directive(&mut self) -> Result<ParsedDirective, Diagnostic> {
+        let dot = self.expect(|kind| matches!(kind, TokenKind::Dot), "expected directive")?;
+        let directive = self.expect_ident("expected directive name after `.`")?;
+        match directive.value.as_str() {
+            "output" => {
+                let predicate = self.expect_ident("expected predicate name after `.output`")?;
+                Ok(ParsedDirective::Output(predicate))
+            }
+            "input" => {
+                let predicate = self.expect_ident("expected predicate name after `.input`")?;
+                Ok(ParsedDirective::Input(predicate))
+            }
+            "decl" => {
+                let predicate = self.expect_ident("expected predicate name after `.decl`")?;
+                self.expect(
+                    |kind| matches!(kind, TokenKind::LeftParen),
+                    "expected `(` in `.decl`",
+                )?;
+                let mut arity = 0;
+                if !self.check(|kind| matches!(kind, TokenKind::RightParen)) {
+                    loop {
+                        self.expect_ident("expected attribute name in `.decl`")?;
+                        self.expect(
+                            |kind| matches!(kind, TokenKind::Colon),
+                            "expected `:` after attribute name",
+                        )?;
+                        self.expect_ident("expected attribute type in `.decl`")?;
+                        arity += 1;
+                        if self
+                            .consume_if(|kind| matches!(kind, TokenKind::Comma))
+                            .is_none()
+                        {
+                            break;
+                        }
+                    }
+                }
+                let right = self.expect(
+                    |kind| matches!(kind, TokenKind::RightParen),
+                    "expected `)` after `.decl`",
+                )?;
+                Ok(ParsedDirective::Declaration(SourceDeclaration {
+                    predicate,
+                    arity,
+                    span: dot.span.join(right.span),
+                }))
+            }
+            _ => Err(Diagnostic {
                 message: format!("unknown directive .{}", directive.value),
                 span: directive.span,
-            });
+            }),
         }
-        let predicate = self.expect_ident("expected predicate name after `.output`")?;
-        self.consume_if(|kind| matches!(kind, TokenKind::Dot));
-        Ok(predicate)
     }
 
-    fn at_output_directive(&self) -> bool {
+    fn at_directive(&self) -> bool {
         self.check(|kind| matches!(kind, TokenKind::Dot))
     }
 
@@ -496,5 +549,24 @@ mod tests {
         assert!(parsed.diagnostics.len() >= 2);
         assert_eq!(parsed.program.rules.len(), 1);
         assert_eq!(parsed.program.rules[0].head.predicate.value, "ok");
+    }
+
+    #[test]
+    fn accepts_practical_souffle_declarations_and_inputs() {
+        let source = "
+            .decl edge(from:symbol, to:symbol)
+            .input edge
+            .decl path(from:symbol, to:symbol)
+            path(x, y) :- edge(x, y).
+            .output path
+        ";
+        let parsed = parse_program(source);
+
+        assert_eq!(parsed.diagnostics, []);
+        assert_eq!(parsed.program.declarations.len(), 2);
+        assert_eq!(parsed.program.declarations[0].arity, 2);
+        assert_eq!(parsed.program.inputs[0].value, "edge");
+        assert_eq!(parsed.program.rules.len(), 1);
+        assert_eq!(parsed.program.outputs[0].value, "path");
     }
 }

@@ -92,6 +92,7 @@ dependencies = [
 name = "sparkalog-datalog"
 version = "0.1.0"
 dependencies = [
+ "rayon",
  "sparkalog-execution",
  "sparkalog-recursion",
  "sparkalog-relational",

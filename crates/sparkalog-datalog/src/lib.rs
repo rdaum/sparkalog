@@ -8,6 +8,7 @@ mod ast;
 mod catalog;
 mod database;
 mod general;
+mod ingest;
 mod parser;
 mod resolve;
 mod schedule;
@@ -15,17 +16,19 @@ mod subset;
 
 pub use ast::{
     ResolvedAtom, ResolvedLiteral, ResolvedProgram, ResolvedRule, ResolvedTerm, SourceAtom,
-    SourceLiteral, SourceProgram, SourceRule, SourceTerm, SourceValue, Span, Spanned, VariableId,
+    SourceDeclaration, SourceLiteral, SourceProgram, SourceRule, SourceTerm, SourceValue, Span,
+    Spanned, VariableId,
 };
 pub use catalog::{
-    CatalogError, InternedValue, PredicateCatalog, PredicateId, PredicateMetadata, ProgramCatalog,
-    ValueCatalog, ValueId,
+    CatalogError, CatalogIoError, InternedValue, PredicateCatalog, PredicateId, PredicateMetadata,
+    ProgramCatalog, ValueCatalog, ValueId,
 };
-pub use database::{Database, DatabaseError, QueryResult, RunSummary};
+pub use database::{Database, DatabaseError, ExecutionBackend, QueryResult, RunSummary};
 pub use general::{
-    GeneralExecution, GeneralExecutionError, GeneralSccSummary, TupleStore, execute_general,
-    lower_general,
+    GeneralExecution, GeneralExecutionError, GeneralSccSummary, PlanStatistics, TupleStore,
+    execute_general, explain_general, lower_general, optimize_general,
 };
+pub use ingest::{DelimitedError, DelimitedOptions, parse_delimited_parallel};
 pub use parser::{Diagnostic, ParseOutput, parse_program};
 pub use resolve::{ResolveOutput, resolve_program};
 pub use schedule::{
