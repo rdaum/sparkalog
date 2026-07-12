@@ -2,8 +2,11 @@ use sparkalog_execution::{
     AntiJoinPlacementPolicy, CudaStream, DistinctPlacementPolicy, InputProvenance,
     JoinPlacementPolicy, UnionPlacementPolicy,
 };
-use sparkalog_recursion::{FixpointDriver, IterationPolicies};
-use sparkalog_storage::{Relation, U32RangeIndex};
+use sparkalog_recursion::{
+    IterationPolicies, RecursiveExecutor, RelationStore, transitive_closure_scc,
+};
+use sparkalog_relational::RelationId;
+use sparkalog_storage::Relation;
 use std::time::Instant;
 
 #[derive(Clone, Copy)]
@@ -120,38 +123,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         edge.column_mut(0).unwrap().as_mut_slice()[row] = row as u32;
         edge.column_mut(1).unwrap().as_mut_slice()[row] = row as u32 + 1;
     }
-    let index = U32RangeIndex::build(edge.column(0).unwrap())?;
     let stream = CudaStream::new()?;
     let (policies, stream) = match config.backend {
         Backend::Auto => (IterationPolicies::default(), Some(&stream)),
         Backend::Cpu => (cpu_policies(), None),
         Backend::Gpu => (gpu_policies(), Some(&stream)),
     };
-    let mut driver = FixpointDriver::new()?;
+    let edge_id = RelationId(0);
+    let path_id = RelationId(1);
+    let mut store = RelationStore::new();
+    store.insert_static(edge_id, edge.view(), InputProvenance::Cpu)?;
+    store.insert_recursive(path_id, edge.view(), edge.view(), InputProvenance::Cpu)?;
+    let mut executor =
+        RecursiveExecutor::compile(transitive_closure_scc(path_id, edge_id), &store)?;
     let start = Instant::now();
-    let summary = driver.run(
-        edge.view(),
-        edge.view(),
-        edge.view(),
-        &index,
-        InputProvenance::Cpu,
-        stream,
-        policies,
-        config.max_iterations,
-    )?;
+    let summary = executor.run(&mut store, stream, policies, config.max_iterations)?;
     let elapsed = start.elapsed();
     let expected = config.vertices * (config.vertices - 1) / 2;
-    assert_eq!(summary.state.full_rows(), expected);
-    assert!(summary.state.reached_fixpoint());
-    assert_eq!(driver.full().unwrap().len(), expected);
-    assert!(driver.newt().unwrap().is_empty());
+    assert_eq!(store.full(path_id)?.len(), expected);
+    assert!(store.delta(path_id)?.is_empty());
     println!(
         "vertices={} closure_rows={} iterations={} elapsed_ms={:.3} last_placements={:?}",
         config.vertices,
-        summary.state.full_rows(),
-        summary.state.iterations(),
+        store.full(path_id)?.len(),
+        summary.iterations,
         elapsed.as_secs_f64() * 1_000.0,
-        summary.last_iteration.placements,
+        summary.last_placements,
     );
     Ok(())
 }

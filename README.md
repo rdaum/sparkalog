@@ -37,9 +37,10 @@ sparkalog-storage ← sparkalog-execution
 - `sparkalog-datalog` owns parsing, validation, stratification, and lowering.
 - `sparkalog` is the executable integration boundary.
 
-The Datalog frontend remains a boundary. The recursion layer now has a complete
-semi-naive transitive-closure step and terminating fixpoint driver over the
-storage, relational, and execution layers without coupling them to syntax.
+The Datalog frontend remains a boundary. The recursion layer now executes
+backend-neutral recursive SCC plans over a relation store keyed by relation ID.
+Each recursive relation owns canonical `FULL`, `DELTA`, and `NEWT` buffers;
+transitive closure is the first plan lowered into that generic path.
 
 ## Filter crossover benchmark
 
@@ -135,10 +136,9 @@ cargo run --release --bin union-crossover -- \
 ```
 
 Serial Rust performs a sorted merge, parallel Rust uses merge-path partitions,
-and CUDA uses CUB device merge followed by unique compaction. The recursion
-crate now combines join, distinct, anti-join, and union in
-`TransitiveClosureStep`; two instances can be ping-ponged so one step consumes
-the prior step's canonical `NEWT` and `FULL` without copying them.
+and CUDA uses CUB device merge followed by unique compaction. Recursive rule
+runtimes swap their anti-join and union outputs into relation-store state, so
+rounds rotate canonical `FULL`, `DELTA`, and `NEWT` buffers without copying.
 
 Run the terminating driver over a generated chain graph with automatic,
 CPU-only, or GPU-only placement:
@@ -147,7 +147,8 @@ CPU-only, or GPU-only placement:
 cargo run --release --bin tc-fixpoint -- --vertices 128 --backend auto
 ```
 
-The driver retains the static `edge` range index, alternates two step
-workspaces, and stops when `NEWT` is empty. `--max-iterations` provides an
-explicit safety bound. The harness verifies the chain's exact
+The executor caches right-side indexes by relation version, evaluates every
+rule in an SCC before applying any updates, and stops when every `DELTA` is
+empty. `--max-iterations` provides an explicit safety bound. The harness
+verifies the chain's exact
 `vertices * (vertices - 1) / 2` transitive closure before reporting timings.

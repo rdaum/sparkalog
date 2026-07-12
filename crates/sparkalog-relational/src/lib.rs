@@ -13,6 +13,9 @@ pub enum RelationVersion {
     Newt,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RelationId(pub u32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ColumnRef {
     pub relation: u32,
@@ -64,6 +67,25 @@ pub struct SortedBinaryAntiJoin {
 pub struct SortedBinaryUnion {
     pub left: [u32; 2],
     pub right: [u32; 2],
+}
+
+/// One semi-naive binary rule lowered to relational operators.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursiveRulePlan {
+    pub target: RelationId,
+    pub delta_input: RelationId,
+    pub right_input: RelationId,
+    pub join: BinaryEqualityJoin,
+    pub distinct: BinaryDistinct,
+    pub anti_join: SortedBinaryAntiJoin,
+    pub union: SortedBinaryUnion,
+}
+
+/// A strongly connected set of recursive relations evaluated round by round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursiveSccPlan {
+    pub relations: Vec<RelationId>,
+    pub rules: Vec<RecursiveRulePlan>,
 }
 
 /// A comparison over one canonical `u32` column.

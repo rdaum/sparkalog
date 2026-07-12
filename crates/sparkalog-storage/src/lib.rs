@@ -267,6 +267,16 @@ impl RelationBuffer {
         })
     }
 
+    pub fn from_view(view: RelationView<'_>) -> Result<Self> {
+        let mut relation = Self::with_capacity(view.arity(), view.len())?;
+        for column in 0..view.arity() {
+            relation.columns[column].as_mut_slice()[..view.len()]
+                .copy_from_slice(view.column_slice(column).expect("column is within arity"));
+        }
+        relation.len = view.len();
+        Ok(relation)
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -341,7 +351,11 @@ pub struct U32RangeIndex {
 
 impl U32RangeIndex {
     pub fn build(column: &Column) -> Result<Self> {
-        let source_rows = column.len();
+        Self::build_slice(column.as_slice())
+    }
+
+    pub fn build_slice(values: &[u32]) -> Result<Self> {
+        let source_rows = values.len();
         if source_rows > u32::MAX as usize {
             return Err(Error::TooManyRows(source_rows));
         }
@@ -349,7 +363,6 @@ impl U32RangeIndex {
         for (row, output) in rows.as_mut_slice().iter_mut().enumerate() {
             *output = row as u32;
         }
-        let values = column.as_slice();
         rows.as_mut_slice()
             .sort_unstable_by_key(|&row| (values[row as usize], row));
 
@@ -716,6 +729,10 @@ impl AntiJoinWorkspace {
         &mut self.output
     }
 
+    pub fn swap_output(&mut self, output: &mut RelationBuffer) {
+        std::mem::swap(&mut self.output, output);
+    }
+
     pub fn count(&self) -> &ManagedBuffer<u32> {
         &self.count
     }
@@ -805,6 +822,10 @@ impl UnionWorkspace {
 
     pub fn output_mut(&mut self) -> &mut RelationBuffer {
         &mut self.output
+    }
+
+    pub fn swap_output(&mut self, output: &mut RelationBuffer) {
+        std::mem::swap(&mut self.output, output);
     }
 
     pub fn count(&self) -> &ManagedBuffer<u64> {
@@ -1145,6 +1166,37 @@ mod tests {
         assert_eq!(output.view().column_slice(0).unwrap(), &[1, 2]);
         assert_eq!(output.view().column_slice(1).unwrap(), &[3, 4]);
         assert_eq!(output.capacity(), 4);
+    }
+
+    #[test]
+    fn relation_buffer_copies_only_the_logical_view() {
+        let mut relation = Relation::new(2, 4).unwrap();
+        relation
+            .column_mut(0)
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&[1, 2, 3, 4]);
+        relation
+            .column_mut(1)
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&[5, 6, 7, 8]);
+        let prefix = relation.view().prefix(2).unwrap();
+
+        let copied = RelationBuffer::from_view(prefix).unwrap();
+
+        assert_eq!(copied.len(), 2);
+        assert_eq!(copied.view().column_slice(0).unwrap(), &[1, 2]);
+        assert_eq!(copied.view().column_slice(1).unwrap(), &[5, 6]);
+    }
+
+    #[test]
+    fn sparse_range_index_can_follow_a_logical_slice() {
+        let index = U32RangeIndex::build_slice(&[7, 42, 7]).unwrap();
+
+        assert_eq!(index.source_rows(), 3);
+        assert_eq!(index.lookup(7), &[0, 2]);
+        assert_eq!(index.lookup(42), &[1]);
     }
 
     #[test]

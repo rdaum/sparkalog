@@ -109,17 +109,23 @@ bitmap, and CUDA count-scan-emit paths. On DBLP, contiguous range postings beat
 becomes fastest at 2,048 delta rows. Binary candidate sorting and
 deduplication are also implemented: a temporary packed `u64` gives serial
 Rust, Rayon parallel sort, and CUDA radix-sort/unique implementations the same
-lexicographic key before results return to canonical `u32` columns. Integration
-The sorted candidate-minus-`FULL` anti-join is now implemented as a serial
+lexicographic key before results return to canonical `u32` columns. The sorted
+candidate-minus-`FULL` anti-join is implemented as a serial
 merge, a parallel chunked merge, and CUDA mark/compact. Sorted `FULL` union
 `NEWT` is implemented with serial merge, parallel merge-path partitions, and
-CUDA device merge/unique. `TransitiveClosureStep` in the recursion crate now
-executes one complete join, distinct, anti-join, and union sequence. Two step
-workspaces are ping-ponged by `FixpointDriver` without copying canonical
-outputs. The CPU scheduler terminates when `NEWT` is empty and enforces an
-explicit iteration limit. The `edge` join index remains static across this
-transitive-closure loop; `FULL` is consumed as a sorted relation by anti-join
-and union rather than rebuilt as a join index.
+CUDA device merge/unique.
+
+The recursion crate now owns a generic `RelationStore` keyed by `RelationId`.
+Recursive relations carry `FULL`, `DELTA`, and `NEWT`; `RecursiveRulePlan`
+contains the backend-neutral join, distinct, anti-join, and union descriptors;
+and `RecursiveExecutor` evaluates every rule in a `RecursiveSccPlan` against
+the same round before swapping outputs into relation state. Right-side indexes
+are cached by relation version and rebuilt only when their source changes.
+Transitive closure is expressed as a plan value through
+`transitive_closure_scc`, not as a specialized execution path. The executor
+supports multiple mutually recursive relations with one lowered rule per
+target relation; combining multiple clauses for one target is the next plan
+generalization.
 
 ### 3. Placement policy
 
@@ -245,9 +251,9 @@ fixpoint:
 
 CUDA conditional graph nodes could eventually move the termination decision
 onto the device, but only after dynamic item counts and overflow handling no
-longer require host intervention. The CPU-driven `FixpointDriver` is therefore
-the correctness and performance baseline against which graph capture should
-be measured.
+longer require host intervention. The CPU-driven `RecursiveExecutor` is
+therefore the correctness and performance baseline against which graph capture
+should be measured.
 
 [spark-memory]: https://docs.nvidia.com/dgx/dgx-spark-porting-guide/overview.html
 [gdlog]: https://github.com/harp-lab/gdlog
