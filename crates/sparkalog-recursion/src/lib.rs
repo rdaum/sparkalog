@@ -33,9 +33,16 @@ impl Default for IterationPolicies {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IterationPlacements {
+pub struct ClausePlacements {
+    pub rule_index: usize,
     pub join: Placement,
     pub distinct: Placement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetPlacements {
+    pub clauses: Vec<ClausePlacements>,
+    pub contribution_unions: Vec<Placement>,
     pub anti_join: Placement,
     pub union: Placement,
 }

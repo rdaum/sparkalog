@@ -40,7 +40,9 @@ sparkalog-storage ← sparkalog-execution
 The Datalog frontend remains a boundary. The recursion layer now executes
 backend-neutral recursive SCC plans over a relation store keyed by relation ID.
 Each recursive relation owns canonical `FULL`, `DELTA`, and `NEWT` buffers;
-transitive closure is the first plan lowered into that generic path.
+multiple clauses for one target are combined and deduplicated before a single
+target-level anti-join, and mutually recursive targets observe the same round.
+Transitive closure is the first plan lowered into that generic path.
 
 ## Filter crossover benchmark
 

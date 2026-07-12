@@ -123,9 +123,12 @@ the same round before swapping outputs into relation state. Right-side indexes
 are cached by relation version and rebuilt only when their source changes.
 Transitive closure is expressed as a plan value through
 `transitive_closure_scc`, not as a specialized execution path. The executor
-supports multiple mutually recursive relations with one lowered rule per
-target relation; combining multiple clauses for one target is the next plan
-generalization.
+supports multiple mutually recursive relations and multiple lowered clauses
+per target. Clause contributions are unioned and deduplicated before one
+target-level anti-join against `FULL`, so overlapping clauses cannot introduce
+duplicates and clause order does not affect the result. The first contribution
+is transferred into the target accumulator by swapping managed buffers rather
+than copying rows.
 
 ### 3. Placement policy
 

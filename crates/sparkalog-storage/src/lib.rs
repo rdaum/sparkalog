@@ -637,6 +637,10 @@ impl DistinctWorkspace {
         &mut self.output
     }
 
+    pub fn swap_output(&mut self, output: &mut RelationBuffer) {
+        std::mem::swap(&mut self.output, output);
+    }
+
     pub fn packed(&self) -> &ManagedBuffer<u64> {
         &self.packed
     }

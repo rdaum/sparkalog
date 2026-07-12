@@ -1,4 +1,6 @@
-use crate::{IterationPlacements, IterationPolicies, combine_provenance, placement_provenance};
+use crate::{
+    ClausePlacements, IterationPolicies, TargetPlacements, combine_provenance, placement_provenance,
+};
 use sparkalog_execution::{
     CudaStream, InputProvenance, Placement, anti_join_auto, distinct_auto, join_auto, union_auto,
 };
@@ -168,9 +170,9 @@ struct CachedIndex {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PendingRule {
-    placements: IterationPlacements,
-    newt_provenance: InputProvenance,
+struct PendingContribution {
+    placements: ClausePlacements,
+    provenance: InputProvenance,
 }
 
 struct RuleRuntime {
@@ -178,9 +180,7 @@ struct RuleRuntime {
     index: Option<CachedIndex>,
     candidates: JoinWorkspace,
     distinct: DistinctWorkspace,
-    newt: AntiJoinWorkspace,
-    union: UnionWorkspace,
-    pending: Option<PendingRule>,
+    pending: Option<PendingContribution>,
 }
 
 impl RuleRuntime {
@@ -190,8 +190,6 @@ impl RuleRuntime {
             index: None,
             candidates: JoinWorkspace::new(2)?,
             distinct: DistinctWorkspace::new()?,
-            newt: AntiJoinWorkspace::new()?,
-            union: UnionWorkspace::new()?,
             pending: None,
         })
     }
@@ -204,7 +202,6 @@ impl RuleRuntime {
     ) -> Result<(), GenericExecutionError> {
         let delta_state = store.state(self.plan.delta_input)?;
         let right_state = store.state(self.plan.right_input)?;
-        let target_state = store.state(self.plan.target)?;
         let delta = delta_state
             .delta
             .as_ref()
@@ -250,20 +247,108 @@ impl RuleRuntime {
             policies.distinct,
         )?;
         let distinct_provenance = placement_provenance(distinct);
-        let anti_provenance = combine_provenance(distinct_provenance, target_state.full_provenance);
+        self.pending = Some(PendingContribution {
+            placements: ClausePlacements {
+                rule_index: 0,
+                join,
+                distinct,
+            },
+            provenance: distinct_provenance,
+        });
+        Ok(())
+    }
+}
+
+struct PendingTarget {
+    placements: TargetPlacements,
+    newt_provenance: InputProvenance,
+}
+
+struct TargetRuntime {
+    target: RelationId,
+    rule_indices: Vec<usize>,
+    anti_join_plan: SortedBinaryAntiJoin,
+    union_plan: SortedBinaryUnion,
+    contributions: RelationBuffer,
+    contribution_union: UnionWorkspace,
+    newt: AntiJoinWorkspace,
+    full_union: UnionWorkspace,
+    pending: Option<PendingTarget>,
+}
+
+impl TargetRuntime {
+    fn new(
+        target: RelationId,
+        rule_indices: Vec<usize>,
+        anti_join_plan: SortedBinaryAntiJoin,
+        union_plan: SortedBinaryUnion,
+    ) -> Result<Self, sparkalog_storage::Error> {
+        Ok(Self {
+            target,
+            rule_indices,
+            anti_join_plan,
+            union_plan,
+            contributions: RelationBuffer::with_capacity(2, 0)?,
+            contribution_union: UnionWorkspace::new()?,
+            newt: AntiJoinWorkspace::new()?,
+            full_union: UnionWorkspace::new()?,
+            pending: None,
+        })
+    }
+
+    fn combine(
+        &mut self,
+        rules: &mut [RuleRuntime],
+        store: &RelationStore,
+        stream: Option<&CudaStream>,
+        policies: IterationPolicies,
+    ) -> Result<(), GenericExecutionError> {
+        self.contributions.clear();
+        let mut clause_placements = Vec::with_capacity(self.rule_indices.len());
+        let mut contribution_unions = Vec::with_capacity(self.rule_indices.len().saturating_sub(1));
+        let mut provenance = InputProvenance::Cpu;
+        for (position, &rule_index) in self.rule_indices.iter().enumerate() {
+            let rule = &mut rules[rule_index];
+            let mut pending = rule
+                .pending
+                .take()
+                .expect("clause was evaluated before target combination");
+            pending.placements.rule_index = rule_index;
+            clause_placements.push(pending.placements);
+            if position == 0 {
+                rule.distinct.swap_output(&mut self.contributions);
+                provenance = pending.provenance;
+                continue;
+            }
+            let union_provenance = combine_provenance(provenance, pending.provenance);
+            let placement = union_auto(
+                self.contributions.view(),
+                rule.distinct.output().view(),
+                self.union_plan,
+                union_provenance,
+                &mut self.contribution_union,
+                stream,
+                policies.union,
+            )?;
+            self.contribution_union.swap_output(&mut self.contributions);
+            provenance = placement_provenance(placement);
+            contribution_unions.push(placement);
+        }
+        let target = store.state(self.target)?;
+        let anti_provenance = combine_provenance(provenance, target.full_provenance);
         let anti_join = anti_join_auto(
-            self.distinct.output().view(),
-            target_state.full.view(),
-            self.plan.anti_join,
+            self.contributions.view(),
+            target.full.view(),
+            self.anti_join_plan,
             anti_provenance,
             &mut self.newt,
             stream,
             policies.anti_join,
         )?;
-        self.pending = Some(PendingRule {
-            placements: IterationPlacements {
-                join,
-                distinct,
+        self.pending = Some(PendingTarget {
+            placements: TargetPlacements {
+                clauses: clause_placements,
+                contribution_unions,
                 anti_join,
                 union: Placement::CpuSerial,
             },
@@ -277,32 +362,32 @@ impl RuleRuntime {
         store: &mut RelationStore,
         stream: Option<&CudaStream>,
         policies: IterationPolicies,
-    ) -> Result<PendingRule, GenericExecutionError> {
+    ) -> Result<PendingTarget, GenericExecutionError> {
         let mut pending = self
             .pending
             .take()
-            .expect("rule was evaluated before apply");
-        let target = store.state_mut(self.plan.target)?;
+            .expect("target was combined before apply");
+        let target = store.state_mut(self.target)?;
         let union_provenance = combine_provenance(target.full_provenance, pending.newt_provenance);
         let union = union_auto(
             target.full.view(),
             self.newt.output().view(),
-            self.plan.union,
+            self.union_plan,
             union_provenance,
-            &mut self.union,
+            &mut self.full_union,
             stream,
             policies.union,
         )?;
         let delta = target
             .delta
             .as_mut()
-            .ok_or(RelationStoreError::NotRecursive(self.plan.target))?;
+            .ok_or(RelationStoreError::NotRecursive(self.target))?;
         let newt = target
             .newt
             .as_mut()
-            .ok_or(RelationStoreError::NotRecursive(self.plan.target))?;
+            .ok_or(RelationStoreError::NotRecursive(self.target))?;
         self.newt.swap_output(newt);
-        self.union.swap_output(&mut target.full);
+        self.full_union.swap_output(&mut target.full);
         std::mem::swap(delta, newt);
         target.delta_provenance = pending.newt_provenance;
         target.full_provenance = placement_provenance(union);
@@ -315,6 +400,7 @@ impl RuleRuntime {
 pub struct RecursiveExecutor {
     relations: Vec<RelationId>,
     rules: Vec<RuleRuntime>,
+    targets: Vec<TargetRuntime>,
 }
 
 impl RecursiveExecutor {
@@ -325,8 +411,12 @@ impl RecursiveExecutor {
         if plan.relations.is_empty() {
             return Err(GenericExecutionError::EmptyScc);
         }
-        let mut targets = Vec::with_capacity(plan.rules.len());
+        let mut seen_relations = Vec::with_capacity(plan.relations.len());
         for &relation in &plan.relations {
+            if seen_relations.contains(&relation) {
+                return Err(GenericExecutionError::DuplicateSccRelation(relation));
+            }
+            seen_relations.push(relation);
             let state = store.state(relation)?;
             if state.delta.is_none() {
                 return Err(RelationStoreError::NotRecursive(relation).into());
@@ -335,18 +425,37 @@ impl RecursiveExecutor {
         for rule in &plan.rules {
             store.state(rule.delta_input)?;
             store.state(rule.right_input)?;
+            if !plan.relations.contains(&rule.delta_input) {
+                return Err(GenericExecutionError::DeltaOutsideScc(rule.delta_input));
+            }
             if !plan.relations.contains(&rule.target) {
                 return Err(GenericExecutionError::TargetOutsideScc(rule.target));
             }
-            if targets.contains(&rule.target) {
-                return Err(GenericExecutionError::DuplicateRuleTarget(rule.target));
-            }
-            targets.push(rule.target);
         }
+        let mut targets = Vec::with_capacity(plan.relations.len());
         for &relation in &plan.relations {
-            if !targets.contains(&relation) {
+            let rule_indices = plan
+                .rules
+                .iter()
+                .enumerate()
+                .filter_map(|(index, rule)| (rule.target == relation).then_some(index))
+                .collect::<Vec<_>>();
+            let Some(&first_index) = rule_indices.first() else {
                 return Err(GenericExecutionError::MissingRuleTarget(relation));
+            };
+            let first = &plan.rules[first_index];
+            if rule_indices.iter().any(|&index| {
+                plan.rules[index].anti_join != first.anti_join
+                    || plan.rules[index].union != first.union
+            }) {
+                return Err(GenericExecutionError::IncompatibleTargetPlans(relation));
             }
+            targets.push(TargetRuntime::new(
+                relation,
+                rule_indices,
+                first.anti_join,
+                first.union,
+            )?);
         }
         let rules = plan
             .rules
@@ -356,6 +465,7 @@ impl RecursiveExecutor {
         Ok(Self {
             relations: plan.relations,
             rules,
+            targets,
         })
     }
 
@@ -379,13 +489,16 @@ impl RecursiveExecutor {
             for rule in &mut self.rules {
                 rule.evaluate(store, stream, policies)?;
             }
+            for target in &mut self.targets {
+                target.combine(&mut self.rules, store, stream, policies)?;
+            }
             placements.clear();
-            for rule in &mut self.rules {
-                let target = rule.plan.target;
-                let pending = rule.apply(store, stream, policies)?;
-                let new_rows = store.delta(target)?.len();
+            for target in &mut self.targets {
+                let id = target.target;
+                let pending = target.apply(store, stream, policies)?;
+                let new_rows = store.delta(id)?.len();
                 total_new_rows += new_rows;
-                placements.push((target, pending.placements));
+                placements.push((id, pending.placements));
             }
             iterations += 1;
         }
@@ -425,7 +538,7 @@ pub struct SccSummary {
     pub iterations: usize,
     pub total_new_rows: usize,
     pub relation_rows: Vec<(RelationId, usize)>,
-    pub last_placements: Vec<(RelationId, IterationPlacements)>,
+    pub last_placements: Vec<(RelationId, TargetPlacements)>,
 }
 
 #[derive(Debug)]
@@ -434,8 +547,10 @@ pub enum GenericExecutionError {
     Storage(sparkalog_storage::Error),
     Execution(sparkalog_execution::Error),
     EmptyScc,
+    DuplicateSccRelation(RelationId),
+    DeltaOutsideScc(RelationId),
     TargetOutsideScc(RelationId),
-    DuplicateRuleTarget(RelationId),
+    IncompatibleTargetPlans(RelationId),
     MissingRuleTarget(RelationId),
     MissingPlanColumn {
         relation: RelationId,
@@ -454,11 +569,21 @@ impl std::fmt::Display for GenericExecutionError {
             Self::Storage(error) => error.fmt(formatter),
             Self::Execution(error) => error.fmt(formatter),
             Self::EmptyScc => formatter.write_str("recursive SCC has no relations"),
+            Self::DuplicateSccRelation(id) => {
+                write!(formatter, "relation {} occurs twice in its SCC", id.0)
+            }
+            Self::DeltaOutsideScc(id) => {
+                write!(formatter, "DELTA relation {} is outside its SCC", id.0)
+            }
             Self::TargetOutsideScc(id) => {
                 write!(formatter, "rule target {} is outside its SCC", id.0)
             }
-            Self::DuplicateRuleTarget(id) => {
-                write!(formatter, "relation {} has multiple rules", id.0)
+            Self::IncompatibleTargetPlans(id) => {
+                write!(
+                    formatter,
+                    "clauses for relation {} use incompatible set plans",
+                    id.0
+                )
             }
             Self::MissingRuleTarget(id) => {
                 write!(formatter, "relation {} has no recursive rule", id.0)
@@ -641,15 +766,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.relation_rows, [(path_id, 6)]);
-        assert!(
-            summary
-                .last_placements
+        assert!(summary.last_placements.iter().all(|(_, placements)| {
+            placements
+                .clauses
                 .iter()
-                .all(|(_, placements)| placements.join == Placement::Gpu
-                    && placements.distinct == Placement::Gpu
-                    && placements.anti_join == Placement::Gpu
-                    && placements.union == Placement::Gpu)
-        );
+                .all(|clause| clause.join == Placement::Gpu && clause.distinct == Placement::Gpu)
+                && placements
+                    .contribution_unions
+                    .iter()
+                    .all(|&placement| placement == Placement::Gpu)
+                && placements.anti_join == Placement::Gpu
+                && placements.union == Placement::Gpu
+        }));
         assert_eq!(
             store.full(path_id).unwrap().view().column_slice(0).unwrap(),
             &[1, 1, 1, 2, 2, 3]
@@ -710,5 +838,110 @@ mod tests {
             store.full(b_id).unwrap().view().column_slice(1).unwrap(),
             &[3, 5, 3, 5]
         );
+    }
+
+    fn run_overlapping_clauses(reverse: bool) -> (SccSummary, Vec<u32>, Vec<u32>) {
+        let first_edge_id = RelationId(0);
+        let second_edge_id = RelationId(1);
+        let path_id = RelationId(2);
+        let first_edge = relation2(&[(2, 3), (3, 4)]);
+        let second_edge = relation2(&[(2, 3), (3, 4), (4, 5)]);
+        let seed = relation2(&[(1, 2)]);
+        let mut store = RelationStore::new();
+        store
+            .insert_static(first_edge_id, first_edge.view(), InputProvenance::Cpu)
+            .unwrap();
+        store
+            .insert_static(second_edge_id, second_edge.view(), InputProvenance::Cpu)
+            .unwrap();
+        store
+            .insert_recursive(path_id, seed.view(), seed.view(), InputProvenance::Cpu)
+            .unwrap();
+        let mut rules = vec![
+            recursive_rule(path_id, path_id, first_edge_id),
+            recursive_rule(path_id, path_id, second_edge_id),
+        ];
+        if reverse {
+            rules.reverse();
+        }
+        let mut executor = RecursiveExecutor::compile(
+            RecursiveSccPlan {
+                relations: vec![path_id],
+                rules,
+            },
+            &store,
+        )
+        .unwrap();
+
+        let summary = executor
+            .run(&mut store, None, IterationPolicies::default(), 16)
+            .unwrap();
+        let full = store.full(path_id).unwrap().view();
+        (
+            summary,
+            full.column_slice(0).unwrap().to_vec(),
+            full.column_slice(1).unwrap().to_vec(),
+        )
+    }
+
+    #[test]
+    fn overlapping_clauses_are_combined_before_anti_join() {
+        let (summary, first, second) = run_overlapping_clauses(false);
+
+        assert_eq!(summary.iterations, 4);
+        assert_eq!(summary.total_new_rows, 3);
+        assert_eq!(summary.relation_rows, [(RelationId(2), 4)]);
+        assert_eq!(first, [1, 1, 1, 1]);
+        assert_eq!(second, [2, 3, 4, 5]);
+        let placements = &summary.last_placements[0].1;
+        assert_eq!(placements.clauses.len(), 2);
+        assert_eq!(placements.contribution_unions.len(), 1);
+    }
+
+    #[test]
+    fn overlapping_clause_results_do_not_depend_on_clause_order() {
+        let (forward_summary, forward_first, forward_second) = run_overlapping_clauses(false);
+        let (reverse_summary, reverse_first, reverse_second) = run_overlapping_clauses(true);
+
+        assert_eq!(forward_summary.iterations, reverse_summary.iterations);
+        assert_eq!(
+            forward_summary.total_new_rows,
+            reverse_summary.total_new_rows
+        );
+        assert_eq!(forward_summary.relation_rows, reverse_summary.relation_rows);
+        assert_eq!(forward_first, reverse_first);
+        assert_eq!(forward_second, reverse_second);
+    }
+
+    #[test]
+    fn clauses_for_one_target_must_share_set_operator_plans() {
+        let edge_id = RelationId(0);
+        let path_id = RelationId(1);
+        let edge = relation2(&[(1, 2)]);
+        let mut store = RelationStore::new();
+        store
+            .insert_static(edge_id, edge.view(), InputProvenance::Cpu)
+            .unwrap();
+        store
+            .insert_recursive(path_id, edge.view(), edge.view(), InputProvenance::Cpu)
+            .unwrap();
+        let first = recursive_rule(path_id, path_id, edge_id);
+        let mut incompatible = first.clone();
+        incompatible.union.right = [1, 0];
+
+        let error = RecursiveExecutor::compile(
+            RecursiveSccPlan {
+                relations: vec![path_id],
+                rules: vec![first, incompatible],
+            },
+            &store,
+        )
+        .err()
+        .expect("incompatible plans must be rejected");
+
+        assert!(matches!(
+            error,
+            GenericExecutionError::IncompatibleTargetPlans(id) if id == path_id
+        ));
     }
 }
