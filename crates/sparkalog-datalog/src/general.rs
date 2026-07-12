@@ -215,7 +215,7 @@ fn execute_scc(
     store: &mut TupleStore,
     max_iterations: usize,
 ) -> Result<GeneralSccSummary, GeneralExecutionError> {
-    let seed_contributions = evaluate_clauses(&scc.seeds, store)?;
+    let seed_contributions = evaluate_clauses(&scc.seeds, store);
     for (target, tuples) in seed_contributions {
         store.full[target.0 as usize].extend(tuples);
     }
@@ -237,7 +237,7 @@ fn execute_scc(
                 limit: max_iterations,
             });
         }
-        let contributions = evaluate_clauses(&scc.recursive_variants, store)?;
+        let contributions = evaluate_clauses(&scc.recursive_variants, store);
         let mut next = scc
             .relations
             .iter()
@@ -281,15 +281,9 @@ fn summary(
     }
 }
 
-fn evaluate_clauses(
-    clauses: &[RelationalClausePlan],
-    store: &TupleStore,
-) -> Result<Contributions, GeneralExecutionError> {
+fn evaluate_clauses(clauses: &[RelationalClausePlan], store: &TupleStore) -> Contributions {
     let mut contributions = Contributions::new();
     for clause in clauses {
-        if !clause.negative.is_empty() {
-            return Err(GeneralExecutionError::NegationNotEnabled);
-        }
         let tuples = evaluate_clause(clause, store);
         if let Some((_, existing)) = contributions
             .iter_mut()
@@ -300,7 +294,7 @@ fn evaluate_clauses(
             contributions.push((clause.target, tuples));
         }
     }
-    Ok(contributions)
+    contributions
 }
 
 fn evaluate_clause(clause: &RelationalClausePlan, store: &TupleStore) -> TupleSet {
@@ -308,6 +302,7 @@ fn evaluate_clause(clause: &RelationalClausePlan, store: &TupleStore) -> TupleSe
         .head
         .iter()
         .chain(clause.positive.iter().flat_map(|atom| atom.terms.iter()))
+        .chain(clause.negative.iter().flat_map(|atom| atom.terms.iter()))
         .filter_map(|term| match term {
             PlanTerm::Binding(binding) => Some(binding.0 as usize + 1),
             PlanTerm::Value(_) => None,
@@ -334,6 +329,21 @@ fn evaluate_clause(clause: &RelationalClausePlan, store: &TupleStore) -> TupleSe
             }
         }
         bindings = joined;
+        if bindings.is_empty() {
+            break;
+        }
+    }
+    for atom in &clause.negative {
+        let rows = &store.full[atom.relation.0 as usize];
+        bindings.retain(|binding| {
+            !rows.iter().any(|tuple| {
+                if tuple.len() != atom.terms.len() {
+                    return false;
+                }
+                let mut candidate = binding.clone();
+                match_atom(&mut candidate, &atom.terms, tuple)
+            })
+        });
         if bindings.is_empty() {
             break;
         }
@@ -371,16 +381,12 @@ fn match_atom(binding: &mut [Option<u32>], terms: &[PlanTerm], tuple: &[u32]) ->
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GeneralExecutionError {
-    NegationNotEnabled,
     IterationLimit { limit: usize },
 }
 
 impl std::fmt::Display for GeneralExecutionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NegationNotEnabled => {
-                formatter.write_str("stratified negation execution is not enabled")
-            }
             Self::IterationLimit { limit } => {
                 write!(
                     formatter,
@@ -476,5 +482,43 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn executes_negation_against_a_completed_earlier_stratum() {
+        let (execution, catalog, plan) = execute(
+            "
+            node('a). node('b). node('c).
+            flag('b, 'yes).
+            blocked(x) :- flag(x, 'yes).
+            allowed(x) :- node(x), !blocked(x).
+            .output allowed
+            ",
+        );
+        let allowed = relation_id(catalog.predicates.id("allowed").unwrap());
+        let blocked = relation_id(catalog.predicates.id("blocked").unwrap());
+
+        assert_eq!(plan.strata.len(), 2);
+        assert_eq!(execution.store.rows(blocked).unwrap().len(), 1);
+        assert_eq!(execution.store.rows(allowed).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn negative_atoms_lower_to_full_inputs_separately_from_novelty() {
+        let parsed = parse_program("node('a). blocked('b). ok(x) :- node(x), !blocked(x).");
+        let mut catalog = ProgramCatalog::new();
+        let resolved = resolve_program(&parsed.program, &mut catalog);
+        let plan = lower_general(&resolved.program).unwrap();
+        let ok = relation_id(catalog.predicates.id("ok").unwrap());
+        let clause = plan
+            .strata
+            .iter()
+            .flat_map(|stratum| &stratum.sccs)
+            .flat_map(|scc| &scc.seeds)
+            .find(|clause| clause.target == ok)
+            .unwrap();
+
+        assert_eq!(clause.negative.len(), 1);
+        assert_eq!(clause.negative[0].version, RelationVersion::Full);
     }
 }
