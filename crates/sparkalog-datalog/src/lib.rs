@@ -8,6 +8,7 @@ mod ast;
 mod catalog;
 mod parser;
 mod resolve;
+mod schedule;
 
 pub use ast::{
     ResolvedAtom, ResolvedLiteral, ResolvedProgram, ResolvedRule, ResolvedTerm, SourceAtom,
@@ -19,6 +20,9 @@ pub use catalog::{
 };
 pub use parser::{Diagnostic, ParseOutput, parse_program};
 pub use resolve::{ResolveOutput, resolve_program};
+pub use schedule::{
+    ProgramSchedule, ScheduledScc, ScheduledStratum, StratificationError, dependencies, stratify,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DependencyKind {
