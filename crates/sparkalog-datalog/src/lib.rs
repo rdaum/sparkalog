@@ -4,8 +4,13 @@
 //! rules into plans from `sparkalog-relational` and fixpoint components from
 //! `sparkalog-recursion`; it will not implement physical operators itself.
 
+mod ast;
 mod catalog;
 
+pub use ast::{
+    ResolvedAtom, ResolvedLiteral, ResolvedProgram, ResolvedRule, ResolvedTerm, SourceAtom,
+    SourceLiteral, SourceProgram, SourceRule, SourceTerm, SourceValue, Span, Spanned, VariableId,
+};
 pub use catalog::{
     CatalogError, InternedValue, PredicateCatalog, PredicateId, PredicateMetadata, ProgramCatalog,
     ValueCatalog, ValueId,
