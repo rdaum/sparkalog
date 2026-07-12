@@ -6,6 +6,7 @@
 
 mod ast;
 mod catalog;
+mod database;
 mod general;
 mod parser;
 mod resolve;
@@ -20,6 +21,7 @@ pub use catalog::{
     CatalogError, InternedValue, PredicateCatalog, PredicateId, PredicateMetadata, ProgramCatalog,
     ValueCatalog, ValueId,
 };
+pub use database::{Database, DatabaseError, QueryResult, RunSummary};
 pub use general::{
     GeneralExecution, GeneralExecutionError, GeneralSccSummary, TupleStore, execute_general,
     lower_general,

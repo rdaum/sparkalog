@@ -13,6 +13,24 @@ pub enum InternedValue {
     Symbol(String),
 }
 
+impl From<u32> for InternedValue {
+    fn from(value: u32) -> Self {
+        Self::U32(value)
+    }
+}
+
+impl From<String> for InternedValue {
+    fn from(value: String) -> Self {
+        Self::Symbol(value)
+    }
+}
+
+impl From<&str> for InternedValue {
+    fn from(value: &str) -> Self {
+        Self::Symbol(value.to_owned())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PredicateMetadata {
     pub name: String,
