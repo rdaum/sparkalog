@@ -83,3 +83,33 @@ for 7,064,738 emitted tuples. `JoinPlacementPolicy::MEASURED_GB10_DBLP`
 therefore switches to CUDA at 2,048 delta rows, or to parallel Rust at the same
 point when CUDA is unavailable. The threshold is specific to this graph's
 fanout and skew; later planning should incorporate estimated output rows.
+
+# DBLP candidate distinct crossover
+
+`distinct-crossover.csv` records sort-and-unique over the candidate relations
+produced by the DBLP expansion join. Each timed sample regenerates its input
+outside the interval with either parallel Rust or CUDA, preserving CPU/GPU
+producer provenance. The timed interval includes tuple packing, sorting,
+unique compaction, unpacking to canonical columns, synchronization, and the
+CPU-visible result length. Exact sorted output is checked against serial Rust
+before samples are recorded.
+
+All implementations use a temporary packed `u64` key for each `(u32, u32)`
+tuple. Serial Rust uses `sort_unstable`, parallel Rust uses Rayon parallel
+sort, and CUDA uses CUB radix sort followed by CUB unique. The packed buffers,
+CUB scratch, unique count, and two output columns are reusable CUDA-managed
+allocations.
+
+Producer provenance did not materially change the crossover on this run.
+Serial Rust won at 7,424 candidate rows: 0.059 ms for CPU-produced input and
+0.050 ms for GPU-produced input, versus 0.094 and 0.090 ms for CUDA. At 31,060
+rows CUDA won at 0.108 and 0.096 ms, versus 0.265 and 0.254 ms for serial Rust.
+CUDA remained fastest above that point. For the full 7,064,738-row candidate
+relation it took 7.829 ms, versus 30.096 ms for parallel Rust and 90.571 ms
+for serial Rust on GPU-produced input.
+
+`DistinctPlacementPolicy::MEASURED_GB10_DBLP` therefore selects serial Rust
+below 32,768 candidate rows and CUDA from 32,768 rows for either producer.
+When CUDA is unavailable, it switches from serial to parallel Rust at 131,072
+rows. These thresholds cover the measured DBLP duplicate rates; tuple width
+and key distribution remain relevant to future generalized distinct plans.

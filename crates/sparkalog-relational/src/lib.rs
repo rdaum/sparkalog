@@ -1,7 +1,8 @@
 //! Backend-neutral relational algebra over Sparkalog's canonical storage.
 
 pub use sparkalog_storage::{
-    Column, JoinWorkspace, Relation, RelationBuffer, RelationView, Selection, U32RangeIndex,
+    Column, DistinctWorkspace, JoinWorkspace, Relation, RelationBuffer, RelationView, Selection,
+    U32RangeIndex,
 };
 
 /// The semi-naive view of a logical relation consumed by an operator.
@@ -43,6 +44,12 @@ pub struct BinaryEqualityJoin {
     pub left_key: u32,
     pub right_key: u32,
     pub output: [JoinProjection; 2],
+}
+
+/// Sort and deduplicate a projected pair of `u32` columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BinaryDistinct {
+    pub columns: [u32; 2],
 }
 
 /// A comparison over one canonical `u32` column.

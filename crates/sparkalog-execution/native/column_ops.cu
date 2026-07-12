@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cub/device/device_scan.cuh>
 #include <cub/device/device_select.cuh>
+#include <cub/device/device_radix_sort.cuh>
 #include <thrust/iterator/counting_iterator.h>
 
 #include <cstddef>
@@ -128,6 +129,36 @@ __global__ void emit_join_u32(
             output1[output_row] = projection1_side == 0
                 ? projection1[left_row]
                 : projection1[right_row];
+        }
+    }
+}
+
+__global__ void pack_binary_u32(
+    const std::uint32_t* first,
+    const std::uint32_t* second,
+    std::size_t rows,
+    std::uint64_t* packed) {
+    const auto start = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    for (auto row = start; row < rows; row += stride) {
+        packed[row] = (static_cast<std::uint64_t>(first[row]) << 32) | second[row];
+    }
+}
+
+__global__ void unpack_binary_u32(
+    const std::uint64_t* packed,
+    const std::uint64_t* unique_rows,
+    std::size_t input_rows,
+    std::uint32_t* first,
+    std::uint32_t* second) {
+    const auto start = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    const auto rows = *unique_rows;
+    for (auto row = start; row < input_rows; row += stride) {
+        if (row < rows) {
+            const auto tuple = packed[row];
+            first[row] = static_cast<std::uint32_t>(tuple >> 32);
+            second[row] = static_cast<std::uint32_t>(tuple);
         }
     }
 }
@@ -346,5 +377,110 @@ extern "C" cudaError_t sparkalog_join_u32_emit(
         offsets,
         output0,
         output1);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t sparkalog_distinct_u32_temporary_bytes(
+    std::uint64_t* packed,
+    std::uint64_t* scratch,
+    std::uint64_t* unique_rows,
+    std::size_t rows,
+    std::size_t* temporary_bytes,
+    void* stream) {
+    if (temporary_bytes == nullptr || unique_rows == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (rows != 0 && (packed == nullptr || scratch == nullptr)) {
+        return cudaErrorInvalidValue;
+    }
+
+    std::size_t sort_bytes = 0;
+    auto status = cub::DeviceRadixSort::SortKeys(
+        nullptr,
+        sort_bytes,
+        packed,
+        scratch,
+        static_cast<::cuda::std::int64_t>(rows),
+        0,
+        64,
+        static_cast<cudaStream_t>(stream));
+    if (status != cudaSuccess) {
+        return status;
+    }
+    std::size_t unique_bytes = 0;
+    status = cub::DeviceSelect::Unique(
+        nullptr,
+        unique_bytes,
+        scratch,
+        packed,
+        unique_rows,
+        static_cast<::cuda::std::int64_t>(rows),
+        static_cast<cudaStream_t>(stream));
+    if (status != cudaSuccess) {
+        return status;
+    }
+    *temporary_bytes = sort_bytes > unique_bytes ? sort_bytes : unique_bytes;
+    return cudaSuccess;
+}
+
+extern "C" cudaError_t sparkalog_distinct_u32(
+    const std::uint32_t* first,
+    const std::uint32_t* second,
+    std::size_t rows,
+    std::uint64_t* packed,
+    std::uint64_t* scratch,
+    std::uint64_t* unique_rows,
+    std::uint32_t* output_first,
+    std::uint32_t* output_second,
+    void* temporary,
+    std::size_t temporary_bytes,
+    void* stream) {
+    if (unique_rows == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (rows == 0) {
+        return cudaMemsetAsync(
+            unique_rows, 0, sizeof(*unique_rows), static_cast<cudaStream_t>(stream));
+    }
+    if (first == nullptr || second == nullptr || packed == nullptr || scratch == nullptr ||
+        output_first == nullptr || output_second == nullptr || temporary == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr unsigned int threads = 256;
+    const auto blocks = static_cast<unsigned int>((rows + threads - 1) / threads);
+    pack_binary_u32<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        first, second, rows, packed);
+    auto status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        return status;
+    }
+    std::size_t available = temporary_bytes;
+    status = cub::DeviceRadixSort::SortKeys(
+        temporary,
+        available,
+        packed,
+        scratch,
+        static_cast<::cuda::std::int64_t>(rows),
+        0,
+        64,
+        static_cast<cudaStream_t>(stream));
+    if (status != cudaSuccess) {
+        return status;
+    }
+    available = temporary_bytes;
+    status = cub::DeviceSelect::Unique(
+        temporary,
+        available,
+        scratch,
+        packed,
+        unique_rows,
+        static_cast<::cuda::std::int64_t>(rows),
+        static_cast<cudaStream_t>(stream));
+    if (status != cudaSuccess) {
+        return status;
+    }
+    unpack_binary_u32<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        packed, unique_rows, rows, output_first, output_second);
     return cudaGetLastError();
 }

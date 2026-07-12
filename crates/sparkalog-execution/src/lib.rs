@@ -3,15 +3,17 @@
 mod placement;
 
 pub use placement::{
-    FilterPlacementContext, FilterPlacementPolicy, InputProvenance, JoinPlacementContext,
-    JoinPlacementPolicy, Placement,
+    DistinctPlacementContext, DistinctPlacementPolicy, FilterPlacementContext,
+    FilterPlacementPolicy, InputProvenance, JoinPlacementContext, JoinPlacementPolicy, Placement,
 };
 
 use rayon::prelude::*;
-use sparkalog_relational::{BinaryEqualityJoin, JoinInput, JoinProjection, U32Predicate};
+use sparkalog_relational::{
+    BinaryDistinct, BinaryEqualityJoin, JoinInput, JoinProjection, U32Predicate,
+};
 use sparkalog_storage::{
-    Column, JoinWorkspace, ManagedBuffer, OperatorWorkspace, RelationView, U32BitmapIndex,
-    U32RangeIndex,
+    Column, DistinctWorkspace, JoinWorkspace, ManagedBuffer, OperatorWorkspace, RelationView,
+    U32BitmapIndex, U32RangeIndex,
 };
 use std::ffi::c_void;
 use std::fmt;
@@ -85,6 +87,27 @@ unsafe extern "C" {
         offsets: *const u64,
         output0: *mut u32,
         output1: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn sparkalog_distinct_u32_temporary_bytes(
+        packed: *mut u64,
+        scratch: *mut u64,
+        unique_rows: *mut u64,
+        rows: usize,
+        temporary_bytes: *mut usize,
+        stream: *mut c_void,
+    ) -> i32;
+    fn sparkalog_distinct_u32(
+        first: *const u32,
+        second: *const u32,
+        rows: usize,
+        packed: *mut u64,
+        scratch: *mut u64,
+        unique_rows: *mut u64,
+        output_first: *mut u32,
+        output_second: *mut u32,
+        temporary: *mut c_void,
+        temporary_bytes: usize,
         stream: *mut c_void,
     ) -> i32;
 }
@@ -249,6 +272,222 @@ fn check_row_count(rows: usize) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn distinct_inputs<'a>(
+    input: RelationView<'a>,
+    plan: BinaryDistinct,
+) -> Result<(&'a [u32], &'a [u32])> {
+    check_row_count(input.len())?;
+    Ok((
+        relation_column(input, "input", plan.columns[0])?,
+        relation_column(input, "input", plan.columns[1])?,
+    ))
+}
+
+fn pack_tuple(first: u32, second: u32) -> u64 {
+    (u64::from(first) << 32) | u64::from(second)
+}
+
+fn deduplicate_sorted(packed: &mut [u64]) -> usize {
+    let mut unique = 0;
+    for read in 0..packed.len() {
+        if unique == 0 || packed[read] != packed[unique - 1] {
+            packed[unique] = packed[read];
+            unique += 1;
+        }
+    }
+    unique
+}
+
+fn unpack_distinct_output(
+    workspace: &mut DistinctWorkspace,
+    unique: usize,
+    parallel: bool,
+) -> Result<()> {
+    let (output, packed) = workspace.cpu_output_parts();
+    let packed = &packed.as_slice()[..unique];
+    let (first, second) = output.columns_mut().split_at_mut(1);
+    let output0 = &mut first[0].as_mut_slice()[..unique];
+    let output1 = &mut second[0].as_mut_slice()[..unique];
+    if parallel {
+        output0
+            .par_iter_mut()
+            .zip(output1.par_iter_mut())
+            .zip(packed.par_iter())
+            .for_each(|((first, second), &tuple)| {
+                *first = (tuple >> 32) as u32;
+                *second = tuple as u32;
+            });
+    } else {
+        for ((first, second), &tuple) in output0.iter_mut().zip(output1).zip(packed) {
+            *first = (tuple >> 32) as u32;
+            *second = tuple as u32;
+        }
+    }
+    output.set_len(unique)?;
+    Ok(())
+}
+
+/// Sort and deduplicate binary tuples on the calling thread.
+pub fn distinct_cpu_serial(
+    input: RelationView<'_>,
+    plan: BinaryDistinct,
+    workspace: &mut DistinctWorkspace,
+) -> Result<()> {
+    let (first, second) = distinct_inputs(input, plan)?;
+    workspace.reserve_rows(input.len())?;
+    workspace.output_mut().clear();
+    let packed = &mut workspace.packed_mut().as_mut_slice()[..input.len()];
+    for ((output, &first), &second) in packed.iter_mut().zip(first).zip(second) {
+        *output = pack_tuple(first, second);
+    }
+    packed.sort_unstable();
+    let unique = deduplicate_sorted(packed);
+    unpack_distinct_output(workspace, unique, false)
+}
+
+/// Sort and deduplicate binary tuples using the persistent Rayon pool.
+pub fn distinct_cpu_parallel(
+    input: RelationView<'_>,
+    plan: BinaryDistinct,
+    workspace: &mut DistinctWorkspace,
+) -> Result<()> {
+    let (first, second) = distinct_inputs(input, plan)?;
+    if input.is_empty() || rayon::current_num_threads() == 1 {
+        return distinct_cpu_serial(input, plan, workspace);
+    }
+    workspace.reserve_rows(input.len())?;
+    workspace.output_mut().clear();
+    let packed = &mut workspace.packed_mut().as_mut_slice()[..input.len()];
+    packed.par_iter_mut().enumerate().for_each(|(row, output)| {
+        *output = pack_tuple(first[row], second[row]);
+    });
+    packed.par_sort_unstable();
+    let unique = deduplicate_sorted(packed);
+    unpack_distinct_output(workspace, unique, true)
+}
+
+#[must_use = "dropping a pending CUDA distinct waits for its stream"]
+pub struct PendingDistinct<'a> {
+    _input: RelationView<'a>,
+    workspace: &'a mut DistinctWorkspace,
+    stream: &'a CudaStream,
+    completed: bool,
+}
+
+impl PendingDistinct<'_> {
+    pub fn wait(mut self) -> Result<()> {
+        self.stream.synchronize()?;
+        let unique_u64 = self.workspace.count().as_slice()[0];
+        let unique = usize::try_from(unique_u64).map_err(|_| Error::OutputTooLarge(unique_u64))?;
+        self.workspace.output_mut().set_len(unique)?;
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingDistinct<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.stream.synchronize();
+        }
+    }
+}
+
+/// Sort and deduplicate binary tuples with CUDA radix sort and unique
+/// compaction over reusable managed buffers.
+pub fn distinct_cuda<'a>(
+    input: RelationView<'a>,
+    plan: BinaryDistinct,
+    workspace: &'a mut DistinctWorkspace,
+    stream: &'a CudaStream,
+) -> Result<PendingDistinct<'a>> {
+    let (first, second) = distinct_inputs(input, plan)?;
+    workspace.reserve_rows(input.len())?;
+    workspace.output_mut().clear();
+    workspace.count_mut().as_mut_slice()[0] = 0;
+
+    let mut temporary_bytes = 0;
+    {
+        let (_, packed, scratch, count, _) = workspace.cuda_parts();
+        // SAFETY: the managed buffers remain live and a null temporary pointer
+        // asks CUB only for its maximum sort/unique workspace requirement.
+        unsafe {
+            cuda_result(
+                "sparkalog_distinct_u32_temporary_bytes",
+                sparkalog_distinct_u32_temporary_bytes(
+                    packed.as_mut_ptr(),
+                    scratch.as_mut_ptr(),
+                    count.as_mut_ptr(),
+                    input.len(),
+                    &mut temporary_bytes,
+                    stream.raw.as_ptr(),
+                ),
+            )?;
+        }
+    }
+    workspace.reserve_temporary_bytes(temporary_bytes)?;
+
+    let launch_result = {
+        let (output, packed, scratch, count, temporary) = workspace.cuda_parts();
+        let (output0, output1) = output.columns_mut().split_at_mut(1);
+        // SAFETY: all pointers refer to live managed allocations. The pending
+        // result retains exclusive workspace access until the stream completes.
+        unsafe {
+            cuda_result(
+                "sparkalog_distinct_u32",
+                sparkalog_distinct_u32(
+                    first.as_ptr(),
+                    second.as_ptr(),
+                    input.len(),
+                    packed.as_mut_ptr(),
+                    scratch.as_mut_ptr(),
+                    count.as_mut_ptr(),
+                    output0[0].as_mut_ptr(),
+                    output1[0].as_mut_ptr(),
+                    temporary.as_mut_ptr().cast(),
+                    temporary_bytes,
+                    stream.raw.as_ptr(),
+                ),
+            )
+        }
+    };
+    if let Err(error) = launch_result {
+        let _ = stream.synchronize();
+        return Err(error);
+    }
+    Ok(PendingDistinct {
+        _input: input,
+        workspace,
+        stream,
+        completed: false,
+    })
+}
+
+/// Execute binary distinct using the backend selected by a measured policy.
+pub fn distinct_auto(
+    input: RelationView<'_>,
+    plan: BinaryDistinct,
+    input_provenance: InputProvenance,
+    workspace: &mut DistinctWorkspace,
+    stream: Option<&CudaStream>,
+    policy: DistinctPlacementPolicy,
+) -> Result<Placement> {
+    let placement = policy.place(DistinctPlacementContext {
+        rows: input.len(),
+        input_provenance,
+        gpu_available: stream.is_some(),
+    });
+    match placement {
+        Placement::CpuSerial => distinct_cpu_serial(input, plan, workspace)?,
+        Placement::CpuParallel => distinct_cpu_parallel(input, plan, workspace)?,
+        Placement::Gpu => {
+            let stream = stream.expect("GPU placement requires an available CUDA stream");
+            distinct_cuda(input, plan, workspace, stream)?.wait()?;
+        }
+    }
+    Ok(placement)
 }
 
 #[derive(Clone, Copy)]
@@ -1041,6 +1280,10 @@ mod tests {
         }
     }
 
+    fn binary_distinct_plan() -> BinaryDistinct {
+        BinaryDistinct { columns: [0, 1] }
+    }
+
     #[test]
     fn serial_and_parallel_filters_match() {
         let values = (0..10_000).map(|value| value % 97).collect::<Vec<_>>();
@@ -1055,6 +1298,102 @@ mod tests {
 
         assert_eq!(serial.selection().as_slice(), expected);
         assert_eq!(parallel.selection().as_slice(), expected);
+    }
+
+    #[test]
+    fn serial_and_parallel_distinct_sort_and_deduplicate_pairs() {
+        let input = relation2(&[(2, 20), (1, 10), (2, 20), (1, 11), (1, 10)]);
+        let mut serial = DistinctWorkspace::new().unwrap();
+        let mut parallel = DistinctWorkspace::new().unwrap();
+        let mut gpu = DistinctWorkspace::new().unwrap();
+        let stream = CudaStream::new().unwrap();
+
+        distinct_cpu_serial(input.view(), binary_distinct_plan(), &mut serial).unwrap();
+        distinct_cpu_parallel(input.view(), binary_distinct_plan(), &mut parallel).unwrap();
+        distinct_cuda(input.view(), binary_distinct_plan(), &mut gpu, &stream)
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert_eq!(serial.output().view().column_slice(0).unwrap(), &[1, 1, 2]);
+        assert_eq!(
+            serial.output().view().column_slice(1).unwrap(),
+            &[10, 11, 20]
+        );
+        for output in [parallel.output(), gpu.output()] {
+            assert_eq!(
+                output.view().column_slice(0),
+                serial.output().view().column_slice(0)
+            );
+            assert_eq!(
+                output.view().column_slice(1),
+                serial.output().view().column_slice(1)
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_distinct_executes_the_selected_backend() {
+        let input = relation2(&[(2, 20), (1, 10), (2, 20), (1, 11), (1, 10)]);
+        let policy = DistinctPlacementPolicy {
+            cpu_produced_gpu_min_rows: 1,
+            gpu_produced_gpu_min_rows: 1,
+            gpu_unavailable_parallel_min_rows: 1,
+        };
+        let mut workspace = DistinctWorkspace::new().unwrap();
+
+        let placement = distinct_auto(
+            input.view(),
+            binary_distinct_plan(),
+            InputProvenance::Cpu,
+            &mut workspace,
+            None,
+            policy,
+        )
+        .unwrap();
+        assert_eq!(placement, Placement::CpuParallel);
+        assert_eq!(
+            workspace.output().view().column_slice(0).unwrap(),
+            &[1, 1, 2]
+        );
+
+        let stream = CudaStream::new().unwrap();
+        let placement = distinct_auto(
+            input.view(),
+            binary_distinct_plan(),
+            InputProvenance::Gpu,
+            &mut workspace,
+            Some(&stream),
+            policy,
+        )
+        .unwrap();
+        assert_eq!(placement, Placement::Gpu);
+        assert_eq!(
+            workspace.output().view().column_slice(1).unwrap(),
+            &[10, 11, 20]
+        );
+    }
+
+    #[test]
+    fn all_distinct_backends_handle_empty_relations() {
+        let input = relation2(&[]);
+        let stream = CudaStream::new().unwrap();
+        let mut workspace = DistinctWorkspace::new().unwrap();
+
+        distinct_cpu_serial(input.view(), binary_distinct_plan(), &mut workspace).unwrap();
+        assert!(workspace.output().is_empty());
+        distinct_cpu_parallel(input.view(), binary_distinct_plan(), &mut workspace).unwrap();
+        assert!(workspace.output().is_empty());
+        distinct_cuda(
+            input.view(),
+            binary_distinct_plan(),
+            &mut workspace,
+            &stream,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        assert!(workspace.output().is_empty());
     }
 
     #[test]

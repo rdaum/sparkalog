@@ -25,5 +25,9 @@ path = "src/bin/graph-smoke.rs"
 name = "join-crossover"
 path = "src/bin/join-crossover.rs"
 
+[[bin]]
+name = "distinct-crossover"
+path = "src/bin/distinct-crossover.rs"
+
 [lints]
 workspace = true

@@ -103,11 +103,14 @@ Represent `edge(src, dst)` and `delta(src, dst)` as columns. Implement the
 regular expansion step of transitive closure, then sort/deduplicate the
 candidate delta. Keep the fixpoint scheduler on the CPU.
 
-The indexed expansion join is now implemented with serial Rust, Rayon, sparse
+The indexed expansion join is implemented with serial Rust, Rayon, sparse
 bitmap, and CUDA count-scan-emit paths. On DBLP, contiguous range postings beat
 `hi_sparse_bitset` postings for this lookup-and-enumerate operation, while CUDA
-becomes fastest at 2,048 delta rows. Sorting, deduplication, and integration
-with the recursive `FULL`/`DELTA`/`NEWT` lifecycle remain the next part of this
+becomes fastest at 2,048 delta rows. Binary candidate sorting and
+deduplication are also implemented: a temporary packed `u64` gives serial
+Rust, Rayon parallel sort, and CUDA radix-sort/unique implementations the same
+lexicographic key before results return to canonical `u32` columns. Integration
+with the recursive `FULL`/`DELTA`/`NEWT` lifecycle remains the next part of this
 slice.
 
 ### 3. Placement policy
@@ -130,6 +133,12 @@ threshold: serial Rust below 2,048 delta rows, then CUDA when available or
 parallel Rust otherwise. Unlike filter placement, this threshold is only a
 starting point because join fanout and key skew can change output cardinality
 substantially for the same input row count.
+
+`DistinctPlacementPolicy::MEASURED_GB10_DBLP` selects serial Rust below 32,768
+candidate rows and CUDA from that point for either CPU- or GPU-produced input.
+Without CUDA it selects parallel Rust from 131,072 rows. The full DBLP join
+candidate relation shrank from 7,064,738 to 4,908,681 tuples in 7.829 ms on
+CUDA, compared with 30.096 ms for parallel Rust.
 
 ## Engine structure
 

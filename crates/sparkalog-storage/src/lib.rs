@@ -581,6 +581,92 @@ impl JoinWorkspace {
     }
 }
 
+/// Reusable managed storage for sorting and deduplicating binary tuples.
+pub struct DistinctWorkspace {
+    output: RelationBuffer,
+    packed: ManagedBuffer<u64>,
+    scratch: ManagedBuffer<u64>,
+    count: ManagedBuffer<u64>,
+    temporary: ManagedBuffer<u8>,
+}
+
+impl DistinctWorkspace {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            output: RelationBuffer::with_capacity(2, 0)?,
+            packed: ManagedBuffer::new_filled(0, 0_u64)?,
+            scratch: ManagedBuffer::new_filled(0, 0_u64)?,
+            count: ManagedBuffer::new_filled(1, 0_u64)?,
+            temporary: ManagedBuffer::new_filled(0, 0_u8)?,
+        })
+    }
+
+    pub fn reserve_rows(&mut self, required: usize) -> Result<()> {
+        self.output.reserve(required)?;
+        reserve_managed_u64(&mut self.packed, required)?;
+        reserve_managed_u64(&mut self.scratch, required)?;
+        Ok(())
+    }
+
+    pub fn reserve_temporary_bytes(&mut self, required: usize) -> Result<()> {
+        if required > self.temporary.len() {
+            let capacity = required.checked_next_power_of_two().unwrap_or(required);
+            self.temporary = ManagedBuffer::new_filled(capacity, 0_u8)?;
+        }
+        Ok(())
+    }
+
+    pub fn output(&self) -> &RelationBuffer {
+        &self.output
+    }
+
+    pub fn output_mut(&mut self) -> &mut RelationBuffer {
+        &mut self.output
+    }
+
+    pub fn packed(&self) -> &ManagedBuffer<u64> {
+        &self.packed
+    }
+
+    pub fn packed_mut(&mut self) -> &mut ManagedBuffer<u64> {
+        &mut self.packed
+    }
+
+    pub fn scratch_mut(&mut self) -> &mut ManagedBuffer<u64> {
+        &mut self.scratch
+    }
+
+    pub fn count(&self) -> &ManagedBuffer<u64> {
+        &self.count
+    }
+
+    pub fn count_mut(&mut self) -> &mut ManagedBuffer<u64> {
+        &mut self.count
+    }
+
+    pub fn cpu_output_parts(&mut self) -> (&mut RelationBuffer, &mut ManagedBuffer<u64>) {
+        (&mut self.output, &mut self.packed)
+    }
+
+    pub fn cuda_parts(
+        &mut self,
+    ) -> (
+        &mut RelationBuffer,
+        &mut ManagedBuffer<u64>,
+        &mut ManagedBuffer<u64>,
+        &mut ManagedBuffer<u64>,
+        &mut ManagedBuffer<u8>,
+    ) {
+        (
+            &mut self.output,
+            &mut self.packed,
+            &mut self.scratch,
+            &mut self.count,
+            &mut self.temporary,
+        )
+    }
+}
+
 /// Compact row identifiers backed by a reusable managed allocation.
 pub struct Selection {
     rows: ManagedBuffer<u32>,
@@ -882,5 +968,18 @@ mod tests {
         assert_eq!(output.view().column_slice(0).unwrap(), &[1, 2]);
         assert_eq!(output.view().column_slice(1).unwrap(), &[3, 4]);
         assert_eq!(output.capacity(), 4);
+    }
+
+    #[test]
+    fn distinct_workspace_reuses_sufficient_allocations() {
+        let mut workspace = DistinctWorkspace::new().unwrap();
+        workspace.reserve_rows(10).unwrap();
+        let packed = workspace.packed().as_ptr();
+        let output = workspace.output().column(0).unwrap().as_ptr();
+
+        workspace.reserve_rows(8).unwrap();
+
+        assert_eq!(workspace.packed().as_ptr(), packed);
+        assert_eq!(workspace.output().column(0).unwrap().as_ptr(), output);
     }
 }

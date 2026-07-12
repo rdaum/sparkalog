@@ -97,3 +97,18 @@ serial and parallel Rust for both index representations, plus CUDA
 count-scan-emit over the managed range index. Every backend must produce
 identical ordered output columns before its timings are recorded. Use
 `--quick` for a three-cardinality smoke run.
+
+Sort and deduplicate those real join candidates with all three execution
+backends using:
+
+```sh
+cargo run --release --bin distinct-crossover -- \
+  --output benchmarks/distinct-crossover.csv
+```
+
+The operator temporarily packs each binary tuple into a managed `u64`, giving
+both Rust sorting and CUDA radix sorting the same lexicographic key. Results
+are unpacked into canonical managed `u32` columns. The benchmark regenerates
+each input immediately before timing with either the parallel Rust or CUDA
+join, and validates identical sorted output from serial Rust, parallel Rust,
+and CUDA. Use `--quick` for a short smoke run.

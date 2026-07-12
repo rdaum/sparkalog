@@ -87,6 +87,45 @@ impl JoinPlacementPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistinctPlacementContext {
+    pub rows: usize,
+    pub input_provenance: InputProvenance,
+    pub gpu_available: bool,
+}
+
+/// Cardinality thresholds for sorting and deduplicating binary tuples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistinctPlacementPolicy {
+    pub cpu_produced_gpu_min_rows: usize,
+    pub gpu_produced_gpu_min_rows: usize,
+    pub gpu_unavailable_parallel_min_rows: usize,
+}
+
+impl DistinctPlacementPolicy {
+    /// Conservative thresholds from `benchmarks/distinct-crossover.csv`,
+    /// recorded on DBLP join candidates on the local GB10.
+    pub const MEASURED_GB10_DBLP: Self = Self {
+        cpu_produced_gpu_min_rows: 32_768,
+        gpu_produced_gpu_min_rows: 32_768,
+        gpu_unavailable_parallel_min_rows: 131_072,
+    };
+
+    pub fn place(self, context: DistinctPlacementContext) -> Placement {
+        let gpu_min_rows = match context.input_provenance {
+            InputProvenance::Cpu => self.cpu_produced_gpu_min_rows,
+            InputProvenance::Gpu => self.gpu_produced_gpu_min_rows,
+        };
+        if context.gpu_available && context.rows >= gpu_min_rows {
+            Placement::Gpu
+        } else if !context.gpu_available && context.rows >= self.gpu_unavailable_parallel_min_rows {
+            Placement::CpuParallel
+        } else {
+            Placement::CpuSerial
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +212,36 @@ mod tests {
             }),
             Placement::CpuParallel
         );
+    }
+
+    #[test]
+    fn measured_distinct_policy_uses_candidate_cardinality() {
+        let policy = DistinctPlacementPolicy::MEASURED_GB10_DBLP;
+        for input_provenance in [InputProvenance::Cpu, InputProvenance::Gpu] {
+            assert_eq!(
+                policy.place(DistinctPlacementContext {
+                    rows: 7_424,
+                    input_provenance,
+                    gpu_available: true,
+                }),
+                Placement::CpuSerial
+            );
+            assert_eq!(
+                policy.place(DistinctPlacementContext {
+                    rows: 32_768,
+                    input_provenance,
+                    gpu_available: true,
+                }),
+                Placement::Gpu
+            );
+            assert_eq!(
+                policy.place(DistinctPlacementContext {
+                    rows: 131_072,
+                    input_provenance,
+                    gpu_available: false,
+                }),
+                Placement::CpuParallel
+            );
+        }
     }
 }
