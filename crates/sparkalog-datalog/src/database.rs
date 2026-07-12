@@ -7,9 +7,9 @@ use sparkalog_relational::{GeneralProgramPlan, RelationId};
 use crate::{
     BinaryExecution, BinaryExecutionError, BinaryProgramPlan, DelimitedError, DelimitedOptions,
     Diagnostic, GeneralExecution, GeneralExecutionError, GeneralSccSummary, InternedValue,
-    LoweringError, PredicateId, ProgramCatalog, ResolvedProgram, execute_binary, execute_general,
-    explain_general, lower_binary, lower_general, parse_delimited_parallel, parse_program,
-    resolve_program,
+    LoweringError, PlanStatistics, PredicateId, ProgramCatalog, ResolvedProgram, execute_binary,
+    execute_general, explain_general, lower_binary, lower_general, optimize_general,
+    parse_delimited_parallel, parse_program, resolve_program,
 };
 
 enum DatabaseExecution {
@@ -151,6 +151,8 @@ impl Database {
     fn run_general(&mut self) -> Result<RunSummary, DatabaseError> {
         let mut plan = self.plan.clone().ok_or(DatabaseError::NoProgram)?;
         plan.facts.extend(self.inserted_facts.iter().cloned());
+        let statistics = PlanStatistics::from_plan(&plan);
+        optimize_general(&mut plan, &statistics);
         let execution = execute_general(&plan, 10_000)?;
         let summary = RunSummary {
             backend: ExecutionBackend::GeneralCpu,
