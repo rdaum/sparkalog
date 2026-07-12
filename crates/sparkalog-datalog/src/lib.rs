@@ -4,8 +4,12 @@
 //! rules into plans from `sparkalog-relational` and fixpoint components from
 //! `sparkalog-recursion`; it will not implement physical operators itself.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PredicateId(pub u32);
+mod catalog;
+
+pub use catalog::{
+    CatalogError, InternedValue, PredicateCatalog, PredicateId, PredicateMetadata, ProgramCatalog,
+    ValueCatalog, ValueId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DependencyKind {
