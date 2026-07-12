@@ -110,8 +110,10 @@ becomes fastest at 2,048 delta rows. Binary candidate sorting and
 deduplication are also implemented: a temporary packed `u64` gives serial
 Rust, Rayon parallel sort, and CUDA radix-sort/unique implementations the same
 lexicographic key before results return to canonical `u32` columns. Integration
-with the recursive `FULL`/`DELTA`/`NEWT` lifecycle remains the next part of this
-slice.
+The sorted candidate-minus-`FULL` anti-join is now implemented as a serial
+merge, a parallel chunked merge, and CUDA mark/compact. The remaining work for
+the recursive `FULL`/`DELTA`/`NEWT` lifecycle is sorted union/merge plus the
+iteration driver.
 
 ### 3. Placement policy
 
@@ -139,6 +141,13 @@ candidate rows and CUDA from that point for either CPU- or GPU-produced input.
 Without CUDA it selects parallel Rust from 131,072 rows. The full DBLP join
 candidate relation shrank from 7,064,738 to 4,908,681 tuples in 7.829 ms on
 CUDA, compared with 30.096 ms for parallel Rust.
+
+`AntiJoinPlacementPolicy::MEASURED_GB10_DBLP` uses the measured provenance
+split: CUDA from 32,768 CPU-produced or 16,384 GPU-produced left rows. Without
+CUDA it selects parallel merge from 32,768 CPU-produced or 262,144 GPU-produced
+rows. In the full first DBLP step, anti-join reduces 4,908,681 candidates to
+4,285,010 `NEWT` tuples in 1.358 ms on CUDA, versus 3.218 ms for parallel Rust
+and 11.294 ms for serial Rust.
 
 ## Engine structure
 

@@ -113,3 +113,32 @@ below 32,768 candidate rows and CUDA from 32,768 rows for either producer.
 When CUDA is unavailable, it switches from serial to parallel Rust at 131,072
 rows. These thresholds cover the measured DBLP duplicate rates; tuple width
 and key distribution remain relevant to future generalized distinct plans.
+
+# DBLP sorted anti-join crossover
+
+`anti-join-crossover.csv` measures the first semi-naive subtraction step:
+`distinct(delta ⋈ edge) − distinct(edge)`. Both sorted inputs are regenerated
+outside every timed interval by either the parallel Rust or CUDA join/distinct
+pipeline. The timed anti-join includes membership work, stable compaction,
+synchronization, and publication of the CPU-visible result length. Every
+backend's ordered output is checked against serial merge subtraction.
+
+Serial Rust performs one linear merge. Parallel Rust partitions the sorted
+left relation, lower-bounds once per chunk, then performs parallel merge-count
+and merge-emit passes; it does not binary-search every tuple. CUDA marks each
+left tuple with a parallel binary search of `FULL`, uses CUB flagged selection,
+and gathers the surviving canonical columns.
+
+The CUDA crossover depends on producer provenance. At 26,126 left rows,
+CPU-produced input was close at 0.047 ms serial versus 0.057 ms CUDA, while
+GPU-produced input favored CUDA at 0.033 ms versus 0.081 ms serial. At 56,770
+rows CUDA won for both producers. `AntiJoinPlacementPolicy::MEASURED_GB10_DBLP`
+therefore uses conservative GPU thresholds of 32,768 CPU-produced rows and
+16,384 GPU-produced rows.
+
+Without CUDA, parallel merge overtook serial between 26,126 and 56,770 rows
+for CPU-produced input, and between 115,959 and 414,541 rows for GPU-produced
+input. The stored fallback thresholds are respectively 32,768 and 262,144
+rows. For the full first step, anti-join reduced 4,908,681 distinct candidates
+to 4,285,010 `NEWT` tuples. CUDA took 1.358 ms, parallel Rust 3.218 ms, and
+serial Rust 11.294 ms for CPU-produced input.

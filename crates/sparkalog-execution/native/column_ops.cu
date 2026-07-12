@@ -163,6 +163,68 @@ __global__ void unpack_binary_u32(
     }
 }
 
+__device__ bool contains_binary_tuple(
+    const std::uint32_t* first,
+    const std::uint32_t* second,
+    std::size_t rows,
+    std::uint32_t target_first,
+    std::uint32_t target_second) {
+    std::size_t low = 0;
+    std::size_t high = rows;
+    while (low < high) {
+        const auto middle = low + (high - low) / 2;
+        const auto candidate_first = first[middle];
+        const auto candidate_second = second[middle];
+        if (candidate_first < target_first ||
+            (candidate_first == target_first && candidate_second < target_second)) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    return low < rows && first[low] == target_first && second[low] == target_second;
+}
+
+__global__ void mark_sorted_binary_anti_join(
+    const std::uint32_t* left_first,
+    const std::uint32_t* left_second,
+    std::size_t left_rows,
+    const std::uint32_t* right_first,
+    const std::uint32_t* right_second,
+    std::size_t right_rows,
+    std::uint32_t* flags) {
+    const auto start = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    for (auto row = start; row < left_rows; row += stride) {
+        flags[row] = contains_binary_tuple(
+            right_first,
+            right_second,
+            right_rows,
+            left_first[row],
+            left_second[row]) ? 0U : 1U;
+    }
+}
+
+__global__ void gather_binary_rows(
+    const std::uint32_t* input_first,
+    const std::uint32_t* input_second,
+    const std::uint32_t* selected,
+    const std::uint32_t* selected_rows,
+    std::size_t input_rows,
+    std::uint32_t* output_first,
+    std::uint32_t* output_second) {
+    const auto start = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    const auto rows = *selected_rows;
+    for (auto output_row = start; output_row < input_rows; output_row += stride) {
+        if (output_row < rows) {
+            const auto input_row = selected[output_row];
+            output_first[output_row] = input_first[input_row];
+            output_second[output_row] = input_second[input_row];
+        }
+    }
+}
+
 }  // namespace
 
 extern "C" cudaError_t sparkalog_add_one_i32(
@@ -482,5 +544,97 @@ extern "C" cudaError_t sparkalog_distinct_u32(
     }
     unpack_binary_u32<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
         packed, unique_rows, rows, output_first, output_second);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t sparkalog_anti_join_u32_temporary_bytes(
+    const std::uint32_t* flags,
+    std::uint32_t* selected,
+    std::uint32_t* selected_rows,
+    std::size_t left_rows,
+    std::size_t* temporary_bytes,
+    void* stream) {
+    if (temporary_bytes == nullptr || selected_rows == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (left_rows != 0 && (flags == nullptr || selected == nullptr)) {
+        return cudaErrorInvalidValue;
+    }
+    auto row_ids = thrust::make_counting_iterator<std::uint32_t>(0);
+    return cub::DeviceSelect::Flagged(
+        nullptr,
+        *temporary_bytes,
+        row_ids,
+        flags,
+        selected,
+        selected_rows,
+        static_cast<::cuda::std::int64_t>(left_rows),
+        static_cast<cudaStream_t>(stream));
+}
+
+extern "C" cudaError_t sparkalog_anti_join_u32(
+    const std::uint32_t* left_first,
+    const std::uint32_t* left_second,
+    std::size_t left_rows,
+    const std::uint32_t* right_first,
+    const std::uint32_t* right_second,
+    std::size_t right_rows,
+    std::uint32_t* flags,
+    std::uint32_t* selected,
+    std::uint32_t* selected_rows,
+    std::uint32_t* output_first,
+    std::uint32_t* output_second,
+    void* temporary,
+    std::size_t temporary_bytes,
+    void* stream) {
+    if (selected_rows == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (left_rows == 0) {
+        return cudaMemsetAsync(
+            selected_rows, 0, sizeof(*selected_rows), static_cast<cudaStream_t>(stream));
+    }
+    if (left_first == nullptr || left_second == nullptr || flags == nullptr ||
+        selected == nullptr || output_first == nullptr || output_second == nullptr ||
+        temporary == nullptr ||
+        (right_rows != 0 && (right_first == nullptr || right_second == nullptr))) {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr unsigned int threads = 256;
+    const auto blocks = static_cast<unsigned int>((left_rows + threads - 1) / threads);
+    mark_sorted_binary_anti_join<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        left_first,
+        left_second,
+        left_rows,
+        right_first,
+        right_second,
+        right_rows,
+        flags);
+    auto status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        return status;
+    }
+    auto row_ids = thrust::make_counting_iterator<std::uint32_t>(0);
+    status = cub::DeviceSelect::Flagged(
+        temporary,
+        temporary_bytes,
+        row_ids,
+        flags,
+        selected,
+        selected_rows,
+        static_cast<::cuda::std::int64_t>(left_rows),
+        static_cast<cudaStream_t>(stream));
+    if (status != cudaSuccess) {
+        return status;
+    }
+    gather_binary_rows<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        left_first,
+        left_second,
+        selected,
+        selected_rows,
+        left_rows,
+        output_first,
+        output_second);
     return cudaGetLastError();
 }

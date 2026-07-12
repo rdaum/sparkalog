@@ -3,17 +3,19 @@
 mod placement;
 
 pub use placement::{
-    DistinctPlacementContext, DistinctPlacementPolicy, FilterPlacementContext,
-    FilterPlacementPolicy, InputProvenance, JoinPlacementContext, JoinPlacementPolicy, Placement,
+    AntiJoinPlacementContext, AntiJoinPlacementPolicy, DistinctPlacementContext,
+    DistinctPlacementPolicy, FilterPlacementContext, FilterPlacementPolicy, InputProvenance,
+    JoinPlacementContext, JoinPlacementPolicy, Placement,
 };
 
 use rayon::prelude::*;
 use sparkalog_relational::{
-    BinaryDistinct, BinaryEqualityJoin, JoinInput, JoinProjection, U32Predicate,
+    BinaryDistinct, BinaryEqualityJoin, JoinInput, JoinProjection, SortedBinaryAntiJoin,
+    U32Predicate,
 };
 use sparkalog_storage::{
-    Column, DistinctWorkspace, JoinWorkspace, ManagedBuffer, OperatorWorkspace, RelationView,
-    U32BitmapIndex, U32RangeIndex,
+    AntiJoinWorkspace, Column, DistinctWorkspace, JoinWorkspace, ManagedBuffer, OperatorWorkspace,
+    RelationView, U32BitmapIndex, U32RangeIndex,
 };
 use std::ffi::c_void;
 use std::fmt;
@@ -104,6 +106,30 @@ unsafe extern "C" {
         packed: *mut u64,
         scratch: *mut u64,
         unique_rows: *mut u64,
+        output_first: *mut u32,
+        output_second: *mut u32,
+        temporary: *mut c_void,
+        temporary_bytes: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    fn sparkalog_anti_join_u32_temporary_bytes(
+        flags: *const u32,
+        selected: *mut u32,
+        selected_rows: *mut u32,
+        left_rows: usize,
+        temporary_bytes: *mut usize,
+        stream: *mut c_void,
+    ) -> i32;
+    fn sparkalog_anti_join_u32(
+        left_first: *const u32,
+        left_second: *const u32,
+        left_rows: usize,
+        right_first: *const u32,
+        right_second: *const u32,
+        right_rows: usize,
+        flags: *mut u32,
+        selected: *mut u32,
+        selected_rows: *mut u32,
         output_first: *mut u32,
         output_second: *mut u32,
         temporary: *mut c_void,
@@ -485,6 +511,362 @@ pub fn distinct_auto(
         Placement::Gpu => {
             let stream = stream.expect("GPU placement requires an available CUDA stream");
             distinct_cuda(input, plan, workspace, stream)?.wait()?;
+        }
+    }
+    Ok(placement)
+}
+
+type BinaryColumns<'a> = (&'a [u32], &'a [u32]);
+
+fn anti_join_inputs<'a>(
+    left: RelationView<'a>,
+    right: RelationView<'a>,
+    plan: SortedBinaryAntiJoin,
+) -> Result<(BinaryColumns<'a>, BinaryColumns<'a>)> {
+    check_row_count(left.len())?;
+    check_row_count(right.len())?;
+    Ok((
+        (
+            relation_column(left, "left", plan.left[0])?,
+            relation_column(left, "left", plan.left[1])?,
+        ),
+        (
+            relation_column(right, "right", plan.right[0])?,
+            relation_column(right, "right", plan.right[1])?,
+        ),
+    ))
+}
+
+fn compare_pair(
+    first: u32,
+    second: u32,
+    other_first: u32,
+    other_second: u32,
+) -> std::cmp::Ordering {
+    (first, second).cmp(&(other_first, other_second))
+}
+
+fn lower_bound_pair(columns: BinaryColumns<'_>, first: u32, second: u32) -> usize {
+    let (right_first, right_second) = columns;
+    let mut low = 0;
+    let mut high = right_first.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match compare_pair(right_first[middle], right_second[middle], first, second) {
+            std::cmp::Ordering::Less => low = middle + 1,
+            std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => high = middle,
+        }
+    }
+    low
+}
+
+fn anti_join_chunk_count(
+    left: BinaryColumns<'_>,
+    right: BinaryColumns<'_>,
+    row_start: usize,
+    row_end: usize,
+) -> u64 {
+    if row_start == row_end {
+        return 0;
+    }
+    let (left_first, left_second) = left;
+    let (right_first, right_second) = right;
+    let mut right_row = lower_bound_pair(right, left_first[row_start], left_second[row_start]);
+    let mut selected = 0_u64;
+    for left_row in row_start..row_end {
+        while right_row < right_first.len()
+            && compare_pair(
+                right_first[right_row],
+                right_second[right_row],
+                left_first[left_row],
+                left_second[left_row],
+            ) == std::cmp::Ordering::Less
+        {
+            right_row += 1;
+        }
+        let matched = right_row < right_first.len()
+            && right_first[right_row] == left_first[left_row]
+            && right_second[right_row] == left_second[left_row];
+        selected += u64::from(!matched);
+    }
+    selected
+}
+
+fn anti_join_chunk_emit(
+    left: BinaryColumns<'_>,
+    right: BinaryColumns<'_>,
+    row_start: usize,
+    row_end: usize,
+    output_first: &mut [u32],
+    output_second: &mut [u32],
+) {
+    if row_start == row_end {
+        return;
+    }
+    let (left_first, left_second) = left;
+    let (right_first, right_second) = right;
+    let mut right_row = lower_bound_pair(right, left_first[row_start], left_second[row_start]);
+    let mut selected = 0;
+    for left_row in row_start..row_end {
+        while right_row < right_first.len()
+            && compare_pair(
+                right_first[right_row],
+                right_second[right_row],
+                left_first[left_row],
+                left_second[left_row],
+            ) == std::cmp::Ordering::Less
+        {
+            right_row += 1;
+        }
+        let matched = right_row < right_first.len()
+            && right_first[right_row] == left_first[left_row]
+            && right_second[right_row] == left_second[left_row];
+        if !matched {
+            output_first[selected] = left_first[left_row];
+            output_second[selected] = left_second[left_row];
+            selected += 1;
+        }
+    }
+}
+
+/// Subtract one sorted binary relation from another with a linear merge.
+pub fn anti_join_cpu_serial(
+    left: RelationView<'_>,
+    right: RelationView<'_>,
+    plan: SortedBinaryAntiJoin,
+    workspace: &mut AntiJoinWorkspace,
+) -> Result<()> {
+    let ((left_first, left_second), (right_first, right_second)) =
+        anti_join_inputs(left, right, plan)?;
+    workspace.reserve_rows(left.len())?;
+    workspace.output_mut().clear();
+    let output = workspace.output_mut();
+    let (first, second) = output.columns_mut().split_at_mut(1);
+    let output_first = first[0].as_mut_slice();
+    let output_second = second[0].as_mut_slice();
+    let mut right_row = 0;
+    let mut selected = 0;
+    for left_row in 0..left.len() {
+        while right_row < right.len()
+            && compare_pair(
+                right_first[right_row],
+                right_second[right_row],
+                left_first[left_row],
+                left_second[left_row],
+            ) == std::cmp::Ordering::Less
+        {
+            right_row += 1;
+        }
+        let matched = right_row < right.len()
+            && right_first[right_row] == left_first[left_row]
+            && right_second[right_row] == left_second[left_row];
+        if !matched {
+            output_first[selected] = left_first[left_row];
+            output_second[selected] = left_second[left_row];
+            selected += 1;
+        }
+    }
+    output.set_len(selected)?;
+    Ok(())
+}
+
+/// Subtract sorted binary relations with parallel merge-count and stable
+/// merge-emit passes over disjoint left chunks.
+pub fn anti_join_cpu_parallel(
+    left: RelationView<'_>,
+    right: RelationView<'_>,
+    plan: SortedBinaryAntiJoin,
+    workspace: &mut AntiJoinWorkspace,
+) -> Result<()> {
+    let (left_columns, right_columns) = anti_join_inputs(left, right, plan)?;
+    if left.is_empty() || rayon::current_num_threads() == 1 {
+        return anti_join_cpu_serial(left, right, plan, workspace);
+    }
+    let left_len = left.len();
+    let workers = rayon::current_num_threads().min(left_len);
+    let chunk_size = left_len.div_ceil(workers);
+    let chunk_count = left_len.div_ceil(chunk_size);
+    workspace.reserve_rows(left_len)?;
+    workspace.reserve_chunks(chunk_count)?;
+    workspace.output_mut().clear();
+
+    let (output, chunk_offsets) = workspace.cpu_parallel_parts();
+    let chunk_offsets = &mut chunk_offsets.as_mut_slice()[..chunk_count];
+    chunk_offsets
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(chunk, count)| {
+            let row_start = chunk * chunk_size;
+            let row_end = (row_start + chunk_size).min(left_len);
+            *count = anti_join_chunk_count(left_columns, right_columns, row_start, row_end);
+        });
+    let mut total = 0_u64;
+    for offset in chunk_offsets.iter_mut() {
+        let count = *offset;
+        *offset = total;
+        total += count;
+    }
+    let total = usize::try_from(total).map_err(|_| Error::OutputTooLarge(total))?;
+    let (first, second) = output.columns_mut().split_at_mut(1);
+    let mut remaining_first = &mut first[0].as_mut_slice()[..total];
+    let mut remaining_second = &mut second[0].as_mut_slice()[..total];
+    let chunk_offsets = &*chunk_offsets;
+
+    rayon::scope(|scope| {
+        for chunk in 0..chunk_count {
+            let row_start = chunk * chunk_size;
+            let row_end = (row_start + chunk_size).min(left_len);
+            let output_start = chunk_offsets[chunk] as usize;
+            let output_end = if chunk + 1 == chunk_count {
+                total
+            } else {
+                chunk_offsets[chunk + 1] as usize
+            };
+            let output_len = output_end - output_start;
+            let (output_first, next_first) = remaining_first.split_at_mut(output_len);
+            let (output_second, next_second) = remaining_second.split_at_mut(output_len);
+            remaining_first = next_first;
+            remaining_second = next_second;
+            scope.spawn(move |_| {
+                anti_join_chunk_emit(
+                    left_columns,
+                    right_columns,
+                    row_start,
+                    row_end,
+                    output_first,
+                    output_second,
+                );
+            });
+        }
+    });
+    output.set_len(total)?;
+    Ok(())
+}
+
+#[must_use = "dropping a pending CUDA anti-join waits for its stream"]
+pub struct PendingAntiJoin<'a> {
+    _left: RelationView<'a>,
+    _right: RelationView<'a>,
+    workspace: &'a mut AntiJoinWorkspace,
+    stream: &'a CudaStream,
+    completed: bool,
+}
+
+impl PendingAntiJoin<'_> {
+    pub fn wait(mut self) -> Result<()> {
+        self.stream.synchronize()?;
+        let selected = self.workspace.count().as_slice()[0] as usize;
+        self.workspace.output_mut().set_len(selected)?;
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingAntiJoin<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.stream.synchronize();
+        }
+    }
+}
+
+/// Subtract sorted binary relations with CUDA membership marking and stable
+/// CUB compaction.
+pub fn anti_join_cuda<'a>(
+    left: RelationView<'a>,
+    right: RelationView<'a>,
+    plan: SortedBinaryAntiJoin,
+    workspace: &'a mut AntiJoinWorkspace,
+    stream: &'a CudaStream,
+) -> Result<PendingAntiJoin<'a>> {
+    let ((left_first, left_second), (right_first, right_second)) =
+        anti_join_inputs(left, right, plan)?;
+    workspace.reserve_rows(left.len())?;
+    workspace.output_mut().clear();
+    workspace.count_mut().as_mut_slice()[0] = 0;
+
+    let mut temporary_bytes = 0;
+    {
+        let (_, selection, flags, count, _) = workspace.cuda_parts();
+        // SAFETY: all pointers refer to live managed buffers. A null temporary
+        // pointer asks CUB only for its compaction workspace requirement.
+        unsafe {
+            cuda_result(
+                "sparkalog_anti_join_u32_temporary_bytes",
+                sparkalog_anti_join_u32_temporary_bytes(
+                    flags.as_ptr(),
+                    selection.storage_mut().as_mut_ptr(),
+                    count.as_mut_ptr(),
+                    left.len(),
+                    &mut temporary_bytes,
+                    stream.raw.as_ptr(),
+                ),
+            )?;
+        }
+    }
+    workspace.reserve_temporary_bytes(temporary_bytes)?;
+
+    let launch_result = {
+        let (output, selection, flags, count, temporary) = workspace.cuda_parts();
+        let (output0, output1) = output.columns_mut().split_at_mut(1);
+        // SAFETY: the pending result retains both inputs and exclusive output
+        // workspace access until the stream completes.
+        unsafe {
+            cuda_result(
+                "sparkalog_anti_join_u32",
+                sparkalog_anti_join_u32(
+                    left_first.as_ptr(),
+                    left_second.as_ptr(),
+                    left.len(),
+                    right_first.as_ptr(),
+                    right_second.as_ptr(),
+                    right.len(),
+                    flags.as_mut_ptr(),
+                    selection.storage_mut().as_mut_ptr(),
+                    count.as_mut_ptr(),
+                    output0[0].as_mut_ptr(),
+                    output1[0].as_mut_ptr(),
+                    temporary.as_mut_ptr().cast(),
+                    temporary_bytes,
+                    stream.raw.as_ptr(),
+                ),
+            )
+        }
+    };
+    if let Err(error) = launch_result {
+        let _ = stream.synchronize();
+        return Err(error);
+    }
+    Ok(PendingAntiJoin {
+        _left: left,
+        _right: right,
+        workspace,
+        stream,
+        completed: false,
+    })
+}
+
+/// Execute sorted binary anti-join using a measured placement policy.
+pub fn anti_join_auto(
+    left: RelationView<'_>,
+    right: RelationView<'_>,
+    plan: SortedBinaryAntiJoin,
+    input_provenance: InputProvenance,
+    workspace: &mut AntiJoinWorkspace,
+    stream: Option<&CudaStream>,
+    policy: AntiJoinPlacementPolicy,
+) -> Result<Placement> {
+    let placement = policy.place(AntiJoinPlacementContext {
+        left_rows: left.len(),
+        input_provenance,
+        gpu_available: stream.is_some(),
+    });
+    match placement {
+        Placement::CpuSerial => anti_join_cpu_serial(left, right, plan, workspace)?,
+        Placement::CpuParallel => anti_join_cpu_parallel(left, right, plan, workspace)?,
+        Placement::Gpu => {
+            let stream = stream.expect("GPU placement requires an available CUDA stream");
+            anti_join_cuda(left, right, plan, workspace, stream)?.wait()?;
         }
     }
     Ok(placement)
@@ -1284,6 +1666,13 @@ mod tests {
         BinaryDistinct { columns: [0, 1] }
     }
 
+    fn sorted_binary_anti_join_plan() -> SortedBinaryAntiJoin {
+        SortedBinaryAntiJoin {
+            left: [0, 1],
+            right: [0, 1],
+        }
+    }
+
     #[test]
     fn serial_and_parallel_filters_match() {
         let values = (0..10_000).map(|value| value % 97).collect::<Vec<_>>();
@@ -1330,6 +1719,150 @@ mod tests {
                 serial.output().view().column_slice(1)
             );
         }
+    }
+
+    #[test]
+    fn serial_and_parallel_anti_join_preserve_sorted_left_difference() {
+        let left = relation2(&[(1, 10), (1, 11), (2, 20), (3, 30), (5, 50)]);
+        let right = relation2(&[(1, 11), (3, 30), (4, 40)]);
+        let mut serial = AntiJoinWorkspace::new().unwrap();
+        let mut parallel = AntiJoinWorkspace::new().unwrap();
+        let mut gpu = AntiJoinWorkspace::new().unwrap();
+        let stream = CudaStream::new().unwrap();
+
+        anti_join_cpu_serial(
+            left.view(),
+            right.view(),
+            sorted_binary_anti_join_plan(),
+            &mut serial,
+        )
+        .unwrap();
+        anti_join_cuda(
+            left.view(),
+            right.view(),
+            sorted_binary_anti_join_plan(),
+            &mut gpu,
+            &stream,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        anti_join_cpu_parallel(
+            left.view(),
+            right.view(),
+            sorted_binary_anti_join_plan(),
+            &mut parallel,
+        )
+        .unwrap();
+
+        assert_eq!(serial.output().view().column_slice(0).unwrap(), &[1, 2, 5]);
+        assert_eq!(
+            serial.output().view().column_slice(1).unwrap(),
+            &[10, 20, 50]
+        );
+        for output in [parallel.output(), gpu.output()] {
+            assert_eq!(
+                output.view().column_slice(0),
+                serial.output().view().column_slice(0)
+            );
+            assert_eq!(
+                output.view().column_slice(1),
+                serial.output().view().column_slice(1)
+            );
+        }
+    }
+
+    #[test]
+    fn all_anti_join_backends_handle_empty_relations() {
+        let empty = relation2(&[]);
+        let left = relation2(&[(1, 10), (2, 20)]);
+        let stream = CudaStream::new().unwrap();
+        let mut workspace = AntiJoinWorkspace::new().unwrap();
+
+        anti_join_cpu_serial(
+            left.view(),
+            empty.view(),
+            sorted_binary_anti_join_plan(),
+            &mut workspace,
+        )
+        .unwrap();
+        assert_eq!(workspace.output().len(), 2);
+        anti_join_cpu_parallel(
+            empty.view(),
+            left.view(),
+            sorted_binary_anti_join_plan(),
+            &mut workspace,
+        )
+        .unwrap();
+        assert!(workspace.output().is_empty());
+        anti_join_cuda(
+            left.view(),
+            empty.view(),
+            sorted_binary_anti_join_plan(),
+            &mut workspace,
+            &stream,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        assert_eq!(workspace.output().len(), 2);
+        anti_join_cuda(
+            empty.view(),
+            left.view(),
+            sorted_binary_anti_join_plan(),
+            &mut workspace,
+            &stream,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        assert!(workspace.output().is_empty());
+    }
+
+    #[test]
+    fn automatic_anti_join_executes_the_selected_backend() {
+        let left = relation2(&[(1, 10), (1, 11), (2, 20), (3, 30), (5, 50)]);
+        let right = relation2(&[(1, 11), (3, 30), (4, 40)]);
+        let policy = AntiJoinPlacementPolicy {
+            cpu_produced_gpu_min_rows: 1,
+            gpu_produced_gpu_min_rows: 1,
+            cpu_produced_parallel_min_rows: 1,
+            gpu_produced_parallel_min_rows: 1,
+        };
+        let mut workspace = AntiJoinWorkspace::new().unwrap();
+
+        let placement = anti_join_auto(
+            left.view(),
+            right.view(),
+            sorted_binary_anti_join_plan(),
+            InputProvenance::Cpu,
+            &mut workspace,
+            None,
+            policy,
+        )
+        .unwrap();
+        assert_eq!(placement, Placement::CpuParallel);
+        assert_eq!(
+            workspace.output().view().column_slice(0).unwrap(),
+            &[1, 2, 5]
+        );
+
+        let stream = CudaStream::new().unwrap();
+        let placement = anti_join_auto(
+            left.view(),
+            right.view(),
+            sorted_binary_anti_join_plan(),
+            InputProvenance::Gpu,
+            &mut workspace,
+            Some(&stream),
+            policy,
+        )
+        .unwrap();
+        assert_eq!(placement, Placement::Gpu);
+        assert_eq!(
+            workspace.output().view().column_slice(1).unwrap(),
+            &[10, 20, 50]
+        );
     }
 
     #[test]

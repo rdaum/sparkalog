@@ -667,6 +667,86 @@ impl DistinctWorkspace {
     }
 }
 
+/// Reusable managed storage for sorted binary anti-join and compaction.
+pub struct AntiJoinWorkspace {
+    output: RelationBuffer,
+    selection: Selection,
+    flags: ManagedBuffer<u32>,
+    count: ManagedBuffer<u32>,
+    chunk_offsets: ManagedBuffer<u64>,
+    temporary: ManagedBuffer<u8>,
+}
+
+impl AntiJoinWorkspace {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            output: RelationBuffer::with_capacity(2, 0)?,
+            selection: Selection::with_capacity(0)?,
+            flags: ManagedBuffer::new_filled(0, 0_u32)?,
+            count: ManagedBuffer::new_filled(1, 0_u32)?,
+            chunk_offsets: ManagedBuffer::new_filled(0, 0_u64)?,
+            temporary: ManagedBuffer::new_filled(0, 0_u8)?,
+        })
+    }
+
+    pub fn reserve_rows(&mut self, required: usize) -> Result<()> {
+        self.output.reserve(required)?;
+        self.selection.reserve(required)?;
+        reserve_managed(&mut self.flags, required)?;
+        Ok(())
+    }
+
+    pub fn reserve_chunks(&mut self, required: usize) -> Result<()> {
+        reserve_managed_u64(&mut self.chunk_offsets, required)
+    }
+
+    pub fn reserve_temporary_bytes(&mut self, required: usize) -> Result<()> {
+        if required > self.temporary.len() {
+            let capacity = required.checked_next_power_of_two().unwrap_or(required);
+            self.temporary = ManagedBuffer::new_filled(capacity, 0_u8)?;
+        }
+        Ok(())
+    }
+
+    pub fn output(&self) -> &RelationBuffer {
+        &self.output
+    }
+
+    pub fn output_mut(&mut self) -> &mut RelationBuffer {
+        &mut self.output
+    }
+
+    pub fn count(&self) -> &ManagedBuffer<u32> {
+        &self.count
+    }
+
+    pub fn count_mut(&mut self) -> &mut ManagedBuffer<u32> {
+        &mut self.count
+    }
+
+    pub fn cpu_parallel_parts(&mut self) -> (&mut RelationBuffer, &mut ManagedBuffer<u64>) {
+        (&mut self.output, &mut self.chunk_offsets)
+    }
+
+    pub fn cuda_parts(
+        &mut self,
+    ) -> (
+        &mut RelationBuffer,
+        &mut Selection,
+        &mut ManagedBuffer<u32>,
+        &mut ManagedBuffer<u32>,
+        &mut ManagedBuffer<u8>,
+    ) {
+        (
+            &mut self.output,
+            &mut self.selection,
+            &mut self.flags,
+            &mut self.count,
+            &mut self.temporary,
+        )
+    }
+}
+
 /// Compact row identifiers backed by a reusable managed allocation.
 pub struct Selection {
     rows: ManagedBuffer<u32>,
@@ -980,6 +1060,19 @@ mod tests {
         workspace.reserve_rows(8).unwrap();
 
         assert_eq!(workspace.packed().as_ptr(), packed);
+        assert_eq!(workspace.output().column(0).unwrap().as_ptr(), output);
+    }
+
+    #[test]
+    fn anti_join_workspace_reuses_sufficient_allocations() {
+        let mut workspace = AntiJoinWorkspace::new().unwrap();
+        workspace.reserve_rows(10).unwrap();
+        workspace.reserve_chunks(4).unwrap();
+        let output = workspace.output().column(0).unwrap().as_ptr();
+
+        workspace.reserve_rows(8).unwrap();
+        workspace.reserve_chunks(3).unwrap();
+
         assert_eq!(workspace.output().column(0).unwrap().as_ptr(), output);
     }
 }

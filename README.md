@@ -112,3 +112,17 @@ are unpacked into canonical managed `u32` columns. The benchmark regenerates
 each input immediately before timing with either the parallel Rust or CUDA
 join, and validates identical sorted output from serial Rust, parallel Rust,
 and CUDA. Use `--quick` for a short smoke run.
+
+Subtract the sorted `FULL` edge relation from those distinct candidates with:
+
+```sh
+cargo run --release --bin anti-join-crossover -- \
+  --output benchmarks/anti-join-crossover.csv
+```
+
+This evaluates the real first-step operation
+`NEWT = distinct(delta ⋈ edge) − distinct(edge)`. Serial Rust uses a sorted
+merge, parallel Rust uses merge-count and merge-emit passes over left chunks,
+and CUDA uses parallel membership marking plus CUB stable compaction. Inputs
+are regenerated immediately before every timed sample with either the native
+or CUDA join/distinct pipeline, and all outputs are checked exactly.
