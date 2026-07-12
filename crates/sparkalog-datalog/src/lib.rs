@@ -7,6 +7,7 @@
 mod ast;
 mod catalog;
 mod parser;
+mod resolve;
 
 pub use ast::{
     ResolvedAtom, ResolvedLiteral, ResolvedProgram, ResolvedRule, ResolvedTerm, SourceAtom,
@@ -17,6 +18,7 @@ pub use catalog::{
     ValueCatalog, ValueId,
 };
 pub use parser::{Diagnostic, ParseOutput, parse_program};
+pub use resolve::{ResolveOutput, resolve_program};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DependencyKind {
